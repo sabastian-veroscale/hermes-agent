@@ -148,11 +148,25 @@ class TestValidateSignature:
         for header in (
             "X-Hub-Signature-256",
             "X-Gitlab-Token",
+            "Sentry-Hook-Signature",
             "X-Webhook-Signature",
         ):
             req = _mock_request(headers={header: hostile})
             # Must return False, never raise.
             assert adapter._validate_signature(req, body, secret) is False
+
+    def test_validate_sentry_signature(self):
+        """Sentry signs the raw request body with the integration secret."""
+        adapter = _make_adapter()
+        body = b'{"action":"triggered","data":{"event":{"event_id":"abc123"}}}'
+        secret = "sentry-hook-secret"
+        signature = hmac.new(secret.encode(), body, hashlib.sha256).hexdigest()
+
+        valid = _mock_request(headers={"Sentry-Hook-Signature": signature})
+        invalid = _mock_request(headers={"Sentry-Hook-Signature": "0" * 64})
+
+        assert adapter._validate_signature(valid, body, secret) is True
+        assert adapter._validate_signature(invalid, body, secret) is False
 
 
     def test_non_ascii_svix_signature_rejected(self):
