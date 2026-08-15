@@ -3610,6 +3610,29 @@ def get_task(conn: sqlite3.Connection, task_id: str) -> Optional[Task]:
     return Task.from_row(row) if row else None
 
 
+def record_worker_session(
+    conn: sqlite3.Connection,
+    task_id: str,
+    session_id: str,
+) -> bool:
+    """Persist a worker's CLI session id onto its task.
+
+    The dispatcher's resume continuation (60/60 iteration-budget churn fix,
+    2026-08-15) passes ``--resume <session_id>`` on retry so a continuation
+    run inherits the prior run's full context instead of re-orienting from
+    zero. The worker writes its own session id here at startup; the dispatcher
+    reads ``task.session_id`` on the next spawn.
+
+    Returns True when a row was updated, False when the task no longer exists.
+    """
+    cur = conn.execute(
+        "UPDATE tasks SET session_id = ? WHERE id = ?",
+        (session_id, task_id),
+    )
+    conn.commit()
+    return cur.rowcount > 0
+
+
 # Canonical sort-order mappings for ``hermes kanban list --sort``.
 # Each value is a raw SQL fragment appended after ``ORDER BY``.
 VALID_SORT_ORDERS: dict[str, str] = {
@@ -10482,6 +10505,16 @@ def _default_spawn(
     worker_toolsets = _resolve_worker_cli_toolsets(env.get("HERMES_HOME"))
     if worker_toolsets:
         cmd.extend(["--toolsets", ",".join(worker_toolsets)])
+    # Session-resume continuation (60/60 iteration-budget churn fix, 2026-08-15):
+    # a retry of a task that already ran resumes the PRIOR worker session via
+    # --resume so the worker continues with full context instead of re-orienting
+    # from zero. The CLI degrades gracefully when the session no longer exists
+    # ("Session not found" -> fresh run), and an explicit -m model override
+    # always wins over the stored session model, so lane pins are preserved.
+    # Goal-mode workers are excluded: their Ralph-style judge loop is
+    # self-contained and must not inherit a prior run's transcript.
+    if task.session_id and not task.goal_mode:
+        cmd.extend(["--resume", task.session_id])
     cmd.extend([
         "chat",
         "-q", prompt,

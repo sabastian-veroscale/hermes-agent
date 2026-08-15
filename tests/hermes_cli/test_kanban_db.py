@@ -1591,3 +1591,142 @@ def test_bare_connect_does_not_close_on_context_exit(tmp_path):
     # Still usable after with-block exit (the leak).
     conn.execute("SELECT 1").fetchone()
     conn.close()  # explicit close to avoid leaking THIS test
+
+
+# ---------------------------------------------------------------------------
+# Resume continuation (60/60 iteration-budget churn fix, 2026-08-15)
+#
+# Retry spawns must pass --resume <session_id> so the worker inherits the
+# prior run's full context instead of re-orienting from zero. The CLI
+# degrades gracefully on a missing session, and an explicit -m model
+# override wins over the stored session model, so lane pins are preserved.
+# ---------------------------------------------------------------------------
+
+class TestResumeContinuation:
+    """`_default_spawn` resume wiring + `record_worker_session` persistence."""
+
+    def _spawn_capture(self, monkeypatch, tmp_path, task):
+        captured = {}
+
+        class _FakePopen:
+            def __init__(self, cmd, **kwargs):
+                captured["cmd"] = cmd
+                self.pid = 4242
+
+        monkeypatch.setattr("subprocess.Popen", _FakePopen)
+        # Keep _default_spawn's log-file open from touching the real board.
+        monkeypatch.setattr(
+            kb, "worker_logs_dir", lambda board=None: tmp_path / "logs"
+        )
+        monkeypatch.setattr(kb, "_rotate_worker_log", lambda *a, **k: None)
+        kb._default_spawn(task, str(tmp_path / "ws"))
+        return captured["cmd"]
+
+    def test_spawn_passes_resume_when_session_recorded(
+        self, tmp_path, monkeypatch
+    ):
+        default_home = tmp_path / ".hermes"
+        default_home.mkdir()
+        monkeypatch.setattr(Path, "home", lambda: tmp_path)
+        monkeypatch.setenv("HERMES_HOME", str(default_home))
+
+        task = kb.Task(
+            id="t_resume_test",
+            title="x",
+            body=None,
+            assignee="coder",
+            status="ready",
+            priority=0,
+            created_by=None,
+            created_at=0,
+            started_at=None,
+            completed_at=None,
+            workspace_kind="scratch",
+            workspace_path=str(tmp_path / "ws"),
+            claim_lock=None,
+            claim_expires=None,
+            tenant=None,
+            branch_name=None,
+            session_id="20260815_120000_abc123",
+        )
+        cmd = self._spawn_capture(monkeypatch, tmp_path, task)
+        assert "--resume" in cmd
+        assert cmd[cmd.index("--resume") + 1] == "20260815_120000_abc123"
+        # The resume flag must precede the chat subcommand.
+        assert cmd.index("--resume") < cmd.index("chat")
+
+    def test_spawn_omits_resume_without_session(self, tmp_path, monkeypatch):
+        default_home = tmp_path / ".hermes"
+        default_home.mkdir()
+        monkeypatch.setattr(Path, "home", lambda: tmp_path)
+        monkeypatch.setenv("HERMES_HOME", str(default_home))
+
+        task = kb.Task(
+            id="t_resume_fresh",
+            title="x",
+            body=None,
+            assignee="coder",
+            status="ready",
+            priority=0,
+            created_by=None,
+            created_at=0,
+            started_at=None,
+            completed_at=None,
+            workspace_kind="scratch",
+            workspace_path=str(tmp_path / "ws"),
+            claim_lock=None,
+            claim_expires=None,
+            tenant=None,
+            branch_name=None,
+            session_id=None,
+        )
+        cmd = self._spawn_capture(monkeypatch, tmp_path, task)
+        assert "--resume" not in cmd
+
+    def test_spawn_omits_resume_for_goal_mode(self, tmp_path, monkeypatch):
+        default_home = tmp_path / ".hermes"
+        default_home.mkdir()
+        monkeypatch.setattr(Path, "home", lambda: tmp_path)
+        monkeypatch.setenv("HERMES_HOME", str(default_home))
+
+        task = kb.Task(
+            id="t_resume_goal",
+            title="x",
+            body=None,
+            assignee="coder",
+            status="ready",
+            priority=0,
+            created_by=None,
+            created_at=0,
+            started_at=None,
+            completed_at=None,
+            workspace_kind="scratch",
+            workspace_path=str(tmp_path / "ws"),
+            claim_lock=None,
+            claim_expires=None,
+            tenant=None,
+            branch_name=None,
+            session_id="20260815_120000_abc123",
+            goal_mode=1,
+        )
+        cmd = self._spawn_capture(monkeypatch, tmp_path, task)
+        assert "--resume" not in cmd
+
+    def test_record_worker_session_persists_and_reports_missing(
+        self, tmp_path, monkeypatch
+    ):
+        default_home = tmp_path / ".hermes"
+        default_home.mkdir()
+        monkeypatch.setattr(Path, "home", lambda: tmp_path)
+        monkeypatch.setenv("HERMES_HOME", str(default_home))
+        kb.init_db()
+        with kb.connect() as conn:
+            task_id = kb.create_task(conn, title="record-test")
+            ok = kb.record_worker_session(
+                conn, task_id, "20260815_130000_def456"
+            )
+            assert ok is True
+            task = kb.get_task(conn, task_id)
+            assert task.session_id == "20260815_130000_def456"
+            # Missing task -> False, no exception.
+            assert kb.record_worker_session(conn, "t_missing", "x") is False

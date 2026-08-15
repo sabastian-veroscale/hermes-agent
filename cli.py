@@ -19080,6 +19080,20 @@ def main(
                     _conn = _kb.connect()
                     try:
                         _task = _kb.get_task(_conn, _kanban_task_id)
+                        # Session-resume continuation (60/60 churn fix, 2026-08-15):
+                        # persist this worker's session id onto the task so a
+                        # retry spawn can pass --resume and inherit this run's
+                        # full context. Best-effort: never block worker startup
+                        # on a write failure.
+                        if _task is not None and getattr(cli, "session_id", None):
+                            try:
+                                _kb.record_worker_session(
+                                    _conn, _kanban_task_id, cli.session_id
+                                )
+                            except Exception:
+                                logger.debug(
+                                    "kanban session-id record failed for %s", _kanban_task_id
+                                )
                     finally:
                         try:
                             _conn.close()
