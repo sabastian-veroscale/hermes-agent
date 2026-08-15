@@ -29230,6 +29230,32 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
     except Exception as _lc_exc:
         logger.debug("Lifecycle ledger startup record failed: %s", _lc_exc)
 
+    # Reap-registry replay (t_819a0094): workers that died during the
+    # previous gateway's lifetime left exit records in the persistent
+    # JSON mirror under the kanban state dir. Replaying them into the
+    # in-process dict at startup means the next dispatcher tick classifies
+    # them correctly (clean_exit / nonzero_exit / signaled) instead of the
+    # ambiguous "pid N not alive" (kanban_db.py:8859). Best-effort: a
+    # missing/corrupt file must NOT prevent gateway startup.
+    try:
+        from hermes_cli.kanban_db import (
+            _flush_recent_worker_exits,
+            _load_recent_worker_exits,
+        )
+        replayed = _load_recent_worker_exits()
+        if replayed:
+            logger.info(
+                "reap-registry replay: %d worker exits restored across restart",
+                replayed,
+            )
+        # Synchronously flush any pending writes from the new gateway on
+        # graceful shutdown so the last few exits that haven't yet hit
+        # the background writer still survive the next restart.
+        import atexit as _atexit_reap
+        _atexit_reap.register(_flush_recent_worker_exits)
+    except Exception as _reap_exc:
+        logger.debug("Reap-registry replay failed (non-fatal): %s", _reap_exc)
+
     try:
         from hermes_cli.nous_auth_keepalive import start_nous_auth_keepalive
 

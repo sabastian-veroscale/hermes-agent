@@ -788,7 +788,13 @@ _OFFICIAL_DOCS_PRICING: Dict[tuple[str, str], PricingEntry] = {
         source_url="https://aws.amazon.com/bedrock/pricing/",
         pricing_version="bedrock-pricing-2026-04",
     ),
-    # MiniMax
+    # MiniMax (Sab's fleet default via https://api.minimax.io/anthropic).
+    # MiniMax-M3 inherits the same $0.30/$1.20 per-MTok input/output rates as
+    # the M2.7 family (per the public pricing page) and applies a 0.10x cache-read
+    # discount on the Anthropic-compatible endpoint. The "MiniMax-M3" key uses
+    # the exact case hermes emits in session_model_usage (the writer was
+    # previously missing this alias, so every M3 row stored
+    # cost_status='unknown' estimated_cost_usd=0).
     (
         "minimax",
         "minimax-m2.7",
@@ -799,11 +805,32 @@ _OFFICIAL_DOCS_PRICING: Dict[tuple[str, str], PricingEntry] = {
         pricing_version="minimax-pricing-2026-04",
     ),
     (
+        "minimax",
+        "minimax-m3",
+    ): PricingEntry(
+        input_cost_per_million=Decimal("0.30"),
+        output_cost_per_million=Decimal("1.20"),
+        cache_read_cost_per_million=Decimal("0.06"),
+        source="official_docs_snapshot",
+        source_url="https://api.minimax.io/anthropic",
+        pricing_version="minimax-pricing-2026-04",
+    ),
+    (
         "minimax-cn",
         "minimax-m2.7",
     ): PricingEntry(
         input_cost_per_million=Decimal("0.30"),
         output_cost_per_million=Decimal("1.20"),
+        source="official_docs_snapshot",
+        pricing_version="minimax-pricing-2026-04",
+    ),
+    (
+        "minimax-cn",
+        "minimax-m3",
+    ): PricingEntry(
+        input_cost_per_million=Decimal("0.30"),
+        output_cost_per_million=Decimal("1.20"),
+        cache_read_cost_per_million=Decimal("0.06"),
         source="official_docs_snapshot",
         pricing_version="minimax-pricing-2026-04",
     ),

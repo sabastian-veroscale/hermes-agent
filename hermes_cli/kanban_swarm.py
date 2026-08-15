@@ -141,8 +141,18 @@ def create_swarm(
     workspace_path: Optional[str] = None,
     priority: int = 0,
     idempotency_key: Optional[str] = None,
+    model_override: Optional[str] = None,
+    provider_override: Optional[str] = None,
 ) -> SwarmCreated:
-    """Atomically create a durable, immediately dispatchable Kanban swarm."""
+    """Atomically create a durable, immediately dispatchable Kanban swarm.
+
+    ``model_override`` / ``provider_override`` pin every card in the swarm
+    (root + workers + verifier + synthesizer) to a single model/backend so
+    the dispatcher doesn't fall back to the assignee profile's configured
+    default — which is usually an interactive-quota model and burns the
+    user's gpt/grok budget when the caller wanted a cheap bulk model like
+    MiniMax-M3. See incident 2026-08-10 t_27793210.
+    """
     activation_summary = (
         "Swarm topology planned; root remains the shared blackboard."
     )
@@ -212,6 +222,8 @@ def _create_swarm_uncommitted(
     workspace_path: Optional[str] = None,
     priority: int = 0,
     idempotency_key: Optional[str] = None,
+    model_override: Optional[str] = None,
+    provider_override: Optional[str] = None,
 ) -> SwarmCreated:
     """Create a durable Kanban swarm graph.
 
@@ -247,6 +259,8 @@ def _create_swarm_uncommitted(
         initial_status="blocked",
         workspace_kind=workspace_kind,
         workspace_path=workspace_path,
+        model_override=model_override,
+        provider_override=provider_override,
     )
 
     # If idempotency returned an existing non-archived root, do not duplicate the
@@ -281,6 +295,8 @@ def _create_swarm_uncommitted(
             workspace_path=workspace_path,
             skills=spec.skills or None,
             max_runtime_seconds=spec.max_runtime_seconds,
+            model_override=model_override,
+            provider_override=provider_override,
         )
         worker_ids.append(worker_id)
 
@@ -302,6 +318,8 @@ def _create_swarm_uncommitted(
         workspace_kind=workspace_kind,
         workspace_path=workspace_path,
         skills=["requesting-code-review"],
+        model_override=model_override,
+        provider_override=provider_override,
     )
 
     synthesizer_body = (
@@ -321,6 +339,8 @@ def _create_swarm_uncommitted(
         workspace_kind=workspace_kind,
         workspace_path=workspace_path,
         skills=["humanizer"],
+        model_override=model_override,
+        provider_override=provider_override,
     )
 
     created = SwarmCreated(root, worker_ids, verifier, synthesizer)

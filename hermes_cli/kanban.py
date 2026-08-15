@@ -435,6 +435,10 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     p_swarm.add_argument("--priority", type=int, default=0, help="Priority tiebreaker")
     p_swarm.add_argument("--created-by", default=None, help="Creator/anchor profile")
     p_swarm.add_argument("--idempotency-key", default=None, help="Dedup key for the root card")
+    p_swarm.add_argument("--model", default=None, dest="model_override",
+                        help="Pin every swarm card to this model (dispatcher override)")
+    p_swarm.add_argument("--provider", default=None, dest="provider_override",
+                        help="Pin every swarm card to this provider (dispatcher override)")
     p_swarm.add_argument("--json", action="store_true", help="Emit JSON output")
 
     # --- list ---
@@ -1723,6 +1727,8 @@ def _cmd_swarm(args: argparse.Namespace) -> int:
             created_by=args.created_by or _profile_author(),
             priority=args.priority,
             idempotency_key=getattr(args, "idempotency_key", None),
+            model_override=getattr(args, "model_override", None),
+            provider_override=getattr(args, "provider_override", None),
         )
     if getattr(args, "json", False):
         print(json.dumps(created.as_dict(), indent=2, ensure_ascii=False))

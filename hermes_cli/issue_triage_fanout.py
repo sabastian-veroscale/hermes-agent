@@ -942,6 +942,15 @@ class FanoutDeps:
     create_task: Any = None  # callable (conn, title, body, parents, idempotency_key) -> task_id
     signal_emit: Any = None  # callable (kind, tag, summary) -> signal_id or None
     parent_link_scan: Any = None  # callable (scout_id) -> set[int] of existing child issue_ids
+    # §5.2: comment_add is called per-issue after a successful create when
+    # ``gh`` failed at fan-out time, to record the GH_UNAVAILABLE_AT_FANOUT
+    # sentinel so a worker or the weekly backfill job can re-fetch the
+    # live title/body. ``None`` (the default) means no comment facility is
+    # wired — GH_UNAVAILABLE_AT_FANOUT is then dropped silently, which is
+    # acceptable in test/sandbox contexts. The hermes CLI wires this to
+    # ``kanban_db.add_comment`` in production (see ``kanban_issue_triage_fanout``
+    # in ``hermes_cli/__main__.py``).
+    comment_add: Any = None
     gh_path: str = "gh"
     # Repo → owner mapping overrides for bare-ref scouts (spec §11
     # follow-up / GAP 2). Merged on top of the built-in
@@ -1038,16 +1047,36 @@ def run_fanout(
         return result
 
     cluster = derive_cluster(body)
-    # Pre-compute inherited scout signal id (real impl uses cfd signals query).
-    scout_signal_id = None
-    if deps.signal_emit is not None and not dry_run:
+    # Pre-compute inherited scout signal id (real impl uses
+    # ``calcifer_signals.lookup_scout_signal`` — spec §5). Previous
+    # versions delegated this to ``deps.signal_emit`` with a sentinel
+    # ``kind="lookup"`` tag, but ``cfd signals emit --kind=insight``
+    # (and ``--kind=lookup``) are rejected by cfd — the call never
+    # returned a real signal id and the body footer always read
+    # "Inherited scout signal: <scout> (no signal emitted — backfill
+    # needed)". Direct lookup via ``calcifer_signals`` fixes both the
+    # invalid kind and the silent-no-op failure mode.
+    scout_signal_id: Optional[str] = None
+    if not dry_run:
+        # Real runs: try to import calcifer_signals inside the loop so
+        # the module is optional (sandboxed tests can run without it).
         try:
-            scout_signal_id = deps.signal_emit(
-                kind="lookup",
-                tag=f"scout:{scout_card_id}",
-                summary="lookup scout signal id",
+            from hermes_cli import calcifer_signals  # type: ignore
+            scout_signal_id = calcifer_signals.lookup_scout_signal(
+                scout_card_id
             )
-        except Exception:  # pragma: no cover — lookup best-effort
+        except Exception:  # pragma: no cover — best-effort
+            scout_signal_id = None
+    else:
+        # Dry-runs still surface the inherited signal id in the
+        # body so an operator can audit the footer before committing
+        # a real run.
+        try:
+            from hermes_cli import calcifer_signals  # type: ignore
+            scout_signal_id = calcifer_signals.lookup_scout_signal(
+                scout_card_id
+            )
+        except Exception:  # pragma: no cover — best-effort
             scout_signal_id = None
 
     existing_children: set[int] = set()
@@ -1174,11 +1203,36 @@ def run_fanout(
         if deps.key_store is not None:
             deps.key_store.mark_created(scout_card_id, ref.issue_id, new_id)
 
+        # §5.2 — when gh failed at fan-out time the per-issue card
+        # lands with the placeholder title and a stub body; record a
+        # GH_UNAVAILABLE_AT_FANOUT comment so the per-issue worker or a
+        # weekly backfill job knows to re-fetch the live title/body.
+        # Best-effort — comment failures don't block the fan-out.
+        if fetch.error and deps.comment_add is not None:
+            try:
+                deps.comment_add(
+                    task_id=new_id,
+                    body=(
+                        "GH_UNAVAILABLE_AT_FANOUT: gh issue view failed "
+                        f"for {ref.repo}#{ref.issue_id} — error: "
+                        f"{fetch.error}. Re-run with gh authenticated, "
+                        "or run the weekly backfill job, to populate "
+                        "the live title + body excerpt."
+                    ),
+                )
+            except Exception:  # pragma: no cover — best-effort comment
+                pass
+
         # Emit per-issue insight signal (spec §5).
+        # ``kind=note`` because (a) cfd rejects ``--kind=insight`` as
+        # invalid (the valid kinds for type=insight are decision|
+        # discovery|pattern|approval|todo|summary|note|cowork) and
+        # (b) this is a session note recording "fan-out: scout -> card
+        # for issue N", which is ``kind=note`` semantics.
         if deps.signal_emit is not None:
             try:
                 deps.signal_emit(
-                    kind="insight",
+                    kind="note",
                     tag=f"issue-fanout:{scout_card_id}:{ref.issue_id}",
                     summary=(
                         f"fan-out: {scout_card_id} -> {new_id} for "
@@ -1411,14 +1465,21 @@ def main(argv: Optional[list[str]] = None) -> int:
         # scout has any comments. Caught by the scan-all path in t_28fd3b11.
         comment_bodies = [c.body or "" for c in comments]
 
-        # Scout signal id lookup is best-effort; absent here.
+        # Scout signal id lookup (spec §5 "Signal inheritance"). The
+        # module calcifer_signals lives next to this file; absent on
+        # stripped-down sandboxes, the fallback returns None and the
+        # body builder writes the "(no signal emitted — backfill
+        # needed)" footer. Implementation: hermes_cli/calcifer_signals.py
+        # (t_35167f36).
         scout_signal_id = None
         try:
             from hermes_cli import calcifer_signals  # type: ignore
             scout_signal_id = calcifer_signals.lookup_scout_signal(
                 args.scout_card_id
             )
-        except Exception:
+        except ImportError:
+            # Module genuinely missing (sandbox). Best-effort: the body
+            # builder handles None → backfill-needed footer.
             scout_signal_id = None
 
         def _create_task(*, title: str, body: str, parents: tuple[str, ...],
@@ -1441,20 +1502,40 @@ def main(argv: Optional[list[str]] = None) -> int:
             )
 
         def _signal_emit(*, kind: str, tag: str, summary: str) -> Optional[str]:
+            # Per-issue insight signal emission (spec §5 audit trail).
+            # Best-effort; on failure the fan-out still completes
+            # because the signal is telemetry, not load-bearing.
             try:
                 from hermes_cli import calcifer_signals  # type: ignore
                 return calcifer_signals.emit(kind=kind, tag=tag, summary=summary)
-            except Exception:
+            except ImportError:
                 return None
 
         def _parent_link_scan(scout_id: str) -> list[int]:
             return list(existing_issue_ids)
+
+        def _comment_add(*, task_id: str, body: str) -> int:
+            # §5.2 — GH_UNAVAILABLE_AT_FANOUT comment after a successful
+            # create when ``gh`` failed at fan-out time. Best-effort;
+            # errors are swallowed here and only surface in audit logs.
+            try:
+                return kb.add_comment(
+                    conn, task_id, "issue-triage-fanout", body
+                )
+            except Exception as exc:  # pragma: no cover — best-effort
+                print(
+                    f"issue-triage-fanout: comment_add failed for "
+                    f"{task_id}: {exc}",
+                    file=sys.stderr,
+                )
+                return 0
 
         deps = FanoutDeps(
             key_store=FanoutKeyStore(args.keys_db),
             create_task=_create_task,
             signal_emit=_signal_emit,
             parent_link_scan=_parent_link_scan,
+            comment_add=_comment_add,
             gh_path=args.gh_path,
             repo_owner_map=getattr(args, "repo_map_dict", None) or None,
         )

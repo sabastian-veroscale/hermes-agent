@@ -493,6 +493,7 @@ def _make_deps(
     create_log: _FakeCreate,
     parent_link_issue_ids: Optional[list[int]] = None,
     signal_id: Optional[str] = None,
+    comment_log: Optional[list[dict[str, Any]]] = None,
 ) -> itf.FanoutDeps:
     def _signal_emit(*, kind: str, tag: str, summary: str) -> Optional[str]:
         return signal_id or f"sig-fake-{tag}"
@@ -500,13 +501,48 @@ def _make_deps(
     def _parent_link_scan(scout_id: str) -> list[int]:
         return list(parent_link_issue_ids or [])
 
+    def _comment_add(*, task_id: str, body: str) -> int:
+        if comment_log is not None:
+            comment_log.append({"task_id": task_id, "body": body})
+        return len(comment_log) if comment_log is not None else 1
+
     return itf.FanoutDeps(
         fetch_gh_issue=fetcher,
         key_store=key_store,
         create_task=create_log,
         signal_emit=_signal_emit,
         parent_link_scan=_parent_link_scan,
+        comment_add=_comment_add if comment_log is not None else None,
     )
+
+
+def _fake_fetch_error(
+    *, error_msg: str = "gh CLI unreachable: 503 Service Unavailable"
+):
+    """Fetcher that always returns an error result (gh down at fan-out time).
+
+    Mirrors the signature of ``fetch_gh_issue`` so deps can be wired up
+    directly. The matching FanoutDeps end-to-end test exercises the
+    ``GH_UNAVAILABLE_AT_FANOUT`` comment path (spec §3 / §5.2).
+    """
+
+    def _impl(
+        owner: str,
+        repo: str,
+        issue_id: int,
+        *,
+        repo_owner_map: Optional[dict[str, str]] = None,
+        gh_path: str = "gh",
+    ):
+        from hermes_cli.issue_triage_fanout import GhFetchResult
+
+        return GhFetchResult(
+            title="",
+            body=None,
+            error=error_msg,
+        )
+
+    return _impl
 
 
 def test_ac2_t12cc81c6_produces_16_detected_issues(temp_keys_db):
@@ -888,6 +924,69 @@ def test_argparser_accepts_spec_flags():
     assert args.max_issues == 5
     assert args.skip_existing is True
     assert args.json is True
+
+
+def test_run_fanout_records_gh_unavailable_comment_when_fetch_fails(temp_keys_db):
+    """Spec §3 / §5.2: when gh issue view fails at fan-out time the
+    per-issue card lands with a placeholder title; a
+    ``GH_UNAVAILABLE_AT_FANOUT`` comment must be recorded on each
+    created card so a per-issue worker or weekly backfill job can
+    re-fetch the live title/body. Comment failures are best-effort
+    and must NOT block the fan-out."""
+    comment_log: list[dict[str, Any]] = []
+    create_log = _FakeCreate()
+    deps = _make_deps(
+        key_store=temp_keys_db,
+        fetcher=_fake_fetch_error(error_msg="gh CLI unreachable: 503"),
+        create_log=create_log,
+        comment_log=comment_log,
+    )
+    result = itf.run_fanout(
+        board="ops",
+        scout_card_id="t_synthetic",
+        scout={
+            "id": "t_synthetic",
+            "title": "acme widgets synthetic scout (gh down)",
+            "body": _synthetic_scout_body(),
+            "comments": [],
+        },
+        deps=deps,
+    )
+    assert result.exit_code() == 0, f"errors: {result.errors}"
+    assert len(result.created) == 3
+    # One GH_UNAVAILABLE_AT_FANOUT comment per created card.
+    assert len(comment_log) == 3
+    for entry in comment_log:
+        assert "GH_UNAVAILABLE_AT_FANOUT" in entry["body"]
+        assert "gh CLI unreachable: 503" in entry["body"]
+        assert entry["task_id"] in {c["id"] for c in create_log.created}
+
+
+def test_run_fanout_no_gh_unavailable_comment_when_fetch_succeeds(temp_keys_db):
+    """Counter-condition: when gh issue view returns real data, we
+    must NOT emit a GH_UNAVAILABLE_AT_FANOUT sentinel — that would
+    pollute the card with a misleading 'missing title' note."""
+    comment_log: list[dict[str, Any]] = []
+    create_log = _FakeCreate()
+    deps = _make_deps(
+        key_store=temp_keys_db,
+        fetcher=_fake_fetch(title="Real title", body="Real body excerpt"),
+        create_log=create_log,
+        comment_log=comment_log,
+    )
+    result = itf.run_fanout(
+        board="ops",
+        scout_card_id="t_synthetic",
+        scout={
+            "id": "t_synthetic",
+            "title": "acme widgets synthetic scout",
+            "body": _synthetic_scout_body(),
+            "comments": [],
+        },
+        deps=deps,
+    )
+    assert len(result.created) == 3
+    assert comment_log == []
 
 
 # ---------------------------------------------------------------------------

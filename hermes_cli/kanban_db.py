@@ -7198,6 +7198,13 @@ def decompose_triage_task(
             "parents": [0, 2],                 # indices into this same children list
         }
 
+    The root task's ``model_override`` and ``provider_override`` are
+    INHERITED into every created child unless the child dict supplies its
+    own. Without this, auto-decomposed children fall back to the assignee
+    profile's default model (e.g. terra/luna/grok interactive quota) even
+    when the user's root card was pinned to a cheap bulk model like
+    MiniMax-M3. See incident 2026-08-10 t_27793210.
+
     Returns the list of created child task ids (in input order) on
     success. Returns ``None`` when:
       - The root task does not exist
@@ -7266,7 +7273,8 @@ def decompose_triage_task(
     child_ids: list[str] = []
     with write_txn(conn):
         root_row = conn.execute(
-            "SELECT id, status, tenant, workspace_kind, workspace_path "
+            "SELECT id, status, tenant, workspace_kind, workspace_path, "
+            "       model_override, provider_override "
             "FROM tasks WHERE id = ?",
             (task_id,),
         ).fetchone()
@@ -7281,6 +7289,21 @@ def decompose_triage_task(
         # override with its own 'workspace_kind' / 'workspace_path'.
         root_ws_kind = root_row["workspace_kind"] or "scratch"
         root_ws_path = root_row["workspace_path"]
+        # Inherit the root's model/provider override so worker children
+        # don't fall back to the assignee profile's default (often an
+        # interactive quota model like terra/luna/grok). Per-child
+        # 'model_override' in the children dict wins over the root.
+        # See incident 2026-08-10 t_27793210 — without this, the
+        # auto-decomposer silently re-pinned fleet workers to the
+        # wrong model, burning interactive quota.
+        root_model_override = (
+            (root_row["model_override"] or "").strip() or None
+            if "model_override" in root_row.keys() else None
+        )
+        root_provider_override = (
+            (root_row["provider_override"] or "").strip() or None
+            if "provider_override" in root_row.keys() else None
+        )
 
         # Create children. Status is 'todo' regardless of parents — we
         # link them under the root AFTER creation so the dispatcher
@@ -7312,11 +7335,19 @@ def decompose_triage_task(
                 child_ws_path = root_ws_path
             else:
                 child_ws_path = None
+            # Per-child model_override wins; otherwise inherit from the
+            # root (see block above). This makes the worker the
+            # auto-decomposer spawns pin to the same model the user
+            # pinned on the root card, instead of falling back to the
+            # assignee profile's configured default.
+            child_model = child.get("model_override") or root_model_override
+            child_provider = child.get("provider_override") or root_provider_override
             conn.execute(
                 "INSERT INTO tasks "
                 "(id, title, body, assignee, status, workspace_kind, "
-                " workspace_path, tenant, created_at, created_by) "
-                "VALUES (?, ?, ?, ?, 'todo', ?, ?, ?, ?, ?)",
+                " workspace_path, tenant, model_override, provider_override, "
+                " created_at, created_by) "
+                "VALUES (?, ?, ?, ?, 'todo', ?, ?, ?, ?, ?, ?, ?)",
                 (
                     new_id,
                     title,
@@ -7325,6 +7356,8 @@ def decompose_triage_task(
                     child_ws_kind,
                     child_ws_path,
                     tenant,
+                    child_model,
+                    child_provider,
                     now,
                     (author or "decomposer"),
                 ),
@@ -7978,32 +8011,252 @@ class DispatchResult:
 # so both ``os.WIFEXITED`` / ``os.WEXITSTATUS`` and ``os.WIFSIGNALED`` can
 # be consulted. Entries are trimmed by age (and total size cap as a
 # belt-and-braces against unbounded growth on exotic platforms).
+#
+# The registry is mirrored to a JSON file under the kanban state dir on
+# every write so it survives gateway restarts — investigation t_81a6af02
+# (2026-08-09–12 crash storm) showed that an empty in-process dict after
+# ``launchctl ... restart`` caused workers that died during the previous
+# gateway's lifetime to be misclassified as ``"unknown"`` → logged as the
+# ambiguous ``f"pid {pid} not alive"``. See :func:`_load_recent_worker_exits`
+# for the startup-side replay path.
+#
+# Persistence runs on a background thread so the hot path stays cheap —
+# ``_record_worker_exit()`` only snapshots the dict and signals the
+# writer. This keeps p99 latency well under the 5ms acceptance criterion
+# from t_819a0094 body even when the disk is slow / fsync-stalled.
 _RECENT_WORKER_EXIT_TTL_SECONDS = 600
 _RECENT_WORKER_EXITS_MAX = 4096
 _recent_worker_exits: "dict[int, tuple[int, float]]" = {}
+_recent_worker_exits_lock = threading.Lock()
+# Background writer state. ``_persist_dirty`` is set on every record; the
+# writer thread snapshots the dict under the lock, clears the flag, and
+# exits if no further work arrived while it was writing.
+_persist_dirty = False
+_persist_cond = threading.Condition(_recent_worker_exits_lock)
+_persist_thread: Optional[threading.Thread] = None
+_persist_stop = False
+
+
+def _recent_worker_exits_path() -> Optional[Path]:
+    """Return the path of the persistent JSON mirror of the reap registry.
+
+    Resolves under the kanban state dir so all profiles share one
+    registry (the board itself is shared by design; per-board isolation
+    would create phantom "pid not alive" entries on every cross-profile
+    dispatch). Returns ``None`` when the kanban home can't be resolved
+    (e.g. inside unusual test setups before ``init_db`` runs).
+    """
+    try:
+        return kanban_home() / "state" / "recent_worker_exits.json"
+    except Exception:
+        return None
+
+
+def _persist_recent_worker_exits_sync(snapshot=None) -> None:
+    """Atomically write the reap registry to its JSON mirror.
+
+    ``snapshot`` may be passed in to avoid re-acquiring the lock when
+    the caller already holds it. Best-effort: errors are logged at
+    WARNING and swallowed — a failed persist must never break the
+    dispatcher (the in-memory dict is the source of truth for the
+    current process; persistence only matters across restarts).
+    Atomic via a ``tmp + os.replace`` write so a partial write can't
+    corrupt the file.
+    """
+    path = _recent_worker_exits_path()
+    if path is None:
+        return
+    try:
+        # If a snapshot wasn't passed, take one under the lock. We
+        # must snapshot-and-write atomically w.r.t. concurrent
+        # _recent_worker_exits mutations, otherwise the on-disk file
+        # can briefly contain a partial / cleared view while the
+        # in-memory dict is being mutated by the reap loop.
+        if snapshot is None:
+            with _recent_worker_exits_lock:
+                snapshot = {
+                    str(pid): [int(raw), float(ts)]
+                    for pid, (raw, ts) in _recent_worker_exits.items()
+                }
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(path.suffix + ".tmp")
+        # JSON encoding: small (≤_RECENT_WORKER_EXITS_MAX entries, each
+        # well under 100 bytes), single atomic write. We deliberately
+        # do NOT fsync: the failure mode this protects against is a
+        # graceful gateway restart (SIGTERM on shutdown → new gateway
+        # starts → reads mirror), not a kernel panic / power loss. The
+        # OS page cache flushes the tmp+rename pair to disk on its own
+        # schedule well within the seconds between SIGTERM and the new
+        # gateway's startup.
+        data = json.dumps(snapshot, separators=(",", ":")).encode("utf-8")
+        with open(tmp, "wb") as f:
+            f.write(data)
+            f.flush()
+        os.replace(tmp, path)
+    except Exception as exc:
+        _log.warning(
+            "reap-registry persist failed (non-fatal): path=%s err=%s",
+            path, exc,
+        )
+
+
+def _persist_writer_loop() -> None:
+    """Background thread: snapshot+write whenever ``_persist_dirty`` is set.
+
+    Sleeps on the condition variable when there's no work. Coalesces
+    bursts of ``_record_worker_exit()`` calls into a single disk write
+    per quiescent period so a stampede of worker exits doesn't queue
+    hundreds of redundant file writes.
+
+    The snapshot is taken under the lock and then written outside it,
+    so the snapshot represents the registry state at the moment we
+    decided to write — subsequent mutations land in the next iteration.
+    """
+    global _persist_stop, _persist_dirty
+    while True:
+        snapshot = None
+        with _persist_cond:
+            while not _persist_dirty and not _persist_stop:
+                _persist_cond.wait()
+            if _persist_stop and not _persist_dirty:
+                return
+            _persist_dirty = False
+            snapshot = {
+                str(pid): [int(raw), float(ts)]
+                for pid, (raw, ts) in _recent_worker_exits.items()
+            }
+        _persist_recent_worker_exits_sync(snapshot=snapshot)
+
+
+def _persist_recent_worker_exits() -> None:
+    """Schedule a background persist. Returns immediately.
+
+    Starts the writer thread on first call (idempotent / lazy).
+    """
+    global _persist_dirty, _persist_thread
+    with _persist_cond:
+        _persist_dirty = True
+        _persist_cond.notify()
+        if _persist_thread is None or not _persist_thread.is_alive():
+            _persist_thread = threading.Thread(
+                target=_persist_writer_loop,
+                name="kanban-reap-registry-persist",
+                daemon=True,
+            )
+            _persist_thread.start()
+
+
+def _load_recent_worker_exits() -> int:
+    """Replay the persistent reap registry into the in-process dict.
+
+    Called once at gateway startup so workers that died during the
+    previous gateway's lifetime classify correctly on the next tick
+    instead of being reported as ``f"pid {pid} not alive"``.
+
+    Best-effort: a missing / corrupt / unreadable file must NOT prevent
+    gateway startup. Failures are logged at WARNING and 0 is returned.
+
+    Returns the number of entries successfully replayed.
+    """
+    path = _recent_worker_exits_path()
+    if path is None:
+        return 0
+    if not path.exists():
+        return 0
+    try:
+        raw = path.read_bytes()
+        if not raw.strip():
+            return 0
+        loaded = json.loads(raw)
+        if not isinstance(loaded, dict):
+            raise ValueError("reap-registry mirror is not a JSON object")
+        now = time.time()
+        cutoff = now - _RECENT_WORKER_EXIT_TTL_SECONDS
+        replayed = 0
+        with _recent_worker_exits_lock:
+            for key, value in loaded.items():
+                try:
+                    pid = int(key)
+                    if pid <= 0:
+                        continue
+                    if not (isinstance(value, (list, tuple)) and len(value) == 2):
+                        continue
+                    raw_status = int(value[0])
+                    ts = float(value[1])
+                    if ts < cutoff:
+                        continue  # expired while gateway was down
+                    # Latest-write-wins: if the new process already
+                    # recorded a fresher exit for this pid, don't clobber.
+                    existing = _recent_worker_exits.get(pid)
+                    if existing is not None and existing[1] >= ts:
+                        continue
+                    _recent_worker_exits[pid] = (raw_status, ts)
+                    replayed += 1
+                except (ValueError, TypeError):
+                    continue
+        if replayed:
+            _log.info(
+                "reap-registry replay: %d entries restored from %s",
+                replayed, path,
+            )
+        return replayed
+    except Exception as exc:
+        _log.warning(
+            "reap-registry replay failed (non-fatal, starting empty): "
+            "path=%s err=%s",
+            path, exc,
+        )
+        return 0
 
 
 def _record_worker_exit(pid: int, raw_status: int) -> None:
     """Record a reaped child's exit status for later classification.
 
     Called from the reap loop in ``dispatch_once``. Safe to call many
-    times; duplicate pids overwrite (pids can cycle, latest wins).
+    times; duplicate pids overwrite (pids can cycle, latest wins). On
+    every write the registry is mirrored to its JSON file under the
+    kanban state dir so a gateway restart does NOT wipe the classification
+    history for workers that died during the previous gateway's lifetime
+    (investigation t_81a6af02).
     """
     if not pid or pid <= 0:
         return
     now = time.time()
-    _recent_worker_exits[int(pid)] = (int(raw_status), now)
-    # Age-based trim: drop entries older than the TTL.
-    if len(_recent_worker_exits) > _RECENT_WORKER_EXITS_MAX // 2:
-        cutoff = now - _RECENT_WORKER_EXIT_TTL_SECONDS
-        for _pid in [p for p, (_s, t) in _recent_worker_exits.items() if t < cutoff]:
-            _recent_worker_exits.pop(_pid, None)
-    # Size cap as a final guard.
-    if len(_recent_worker_exits) > _RECENT_WORKER_EXITS_MAX:
-        # Drop oldest half.
-        ordered = sorted(_recent_worker_exits.items(), key=lambda kv: kv[1][1])
-        for _pid, _ in ordered[: len(ordered) // 2]:
-            _recent_worker_exits.pop(_pid, None)
+    with _recent_worker_exits_lock:
+        _recent_worker_exits[int(pid)] = (int(raw_status), now)
+        # Age-based trim: drop entries older than the TTL.
+        if len(_recent_worker_exits) > _RECENT_WORKER_EXITS_MAX // 2:
+            cutoff = now - _RECENT_WORKER_EXIT_TTL_SECONDS
+            for _pid in [p for p, (_s, t) in _recent_worker_exits.items() if t < cutoff]:
+                _recent_worker_exits.pop(_pid, None)
+        # Size cap as a final guard.
+        if len(_recent_worker_exits) > _RECENT_WORKER_EXITS_MAX:
+            # Drop oldest half.
+            ordered = sorted(_recent_worker_exits.items(), key=lambda kv: kv[1][1])
+            for _pid, _ in ordered[: len(ordered) // 2]:
+                _recent_worker_exits.pop(_pid, None)
+    # Persist via background writer thread — see _persist_writer_loop.
+    # The hot path only marks the registry dirty and signals the
+    # writer; disk I/O happens off the dispatcher thread.
+    _persist_recent_worker_exits()
+
+
+def _flush_recent_worker_exits() -> None:
+    """Synchronously flush any pending persist (test helper + gateway
+    shutdown safety net).
+
+    Drains the dirty flag under the lock and writes the current
+    snapshot inline. Cheap (one file write) and called at most once
+    per gateway lifetime — atexit on shutdown — so the cost is
+    irrelevant there. Useful in tests so they can assert on the
+    on-disk mirror without sleeping for the background thread to wake.
+    """
+    global _persist_dirty
+    with _persist_cond:
+        if not _persist_dirty:
+            return
+        _persist_dirty = False
+    _persist_recent_worker_exits_sync()
 
 
 def _classify_worker_exit(pid: int) -> "tuple[str, Optional[int]]":
@@ -9724,7 +9977,20 @@ def _dispatch_once_locked(
         if max_spawn is not None and running_count + spawned >= max_spawn:
             break
         row_assignee = row["assignee"]
-        if not row_assignee:
+        # Treat the literal string "default" as effectively-unassigned for the
+        # rewrite: ``profile_exists("default")`` is hardcoded to True in
+        # hermes_cli/profiles.py (no real ``profiles/default/`` directory is
+        # ever created), so a task created with ``assignee='default'`` would
+        # otherwise fall through to ``_default_spawn`` -> ``hermes -p default``
+        # -> root config, burning whatever ``model.default`` / fallback the
+        # root config holds (fleet routing directive 2026-08-10: that has
+        # already drifted to grok-build-0.1 -> deepseek-v4-flash). Cron task
+        # creators (auto-decomposer, automation-discovery, scout, workflow:*)
+        # intentionally emit ``assignee='default'`` for "no human lane" work,
+        # and that work belongs on the fleet profile (calcifer / MiniMax-M3).
+        # The ``kanban.default_assignee`` rewrite below is the single
+        # honour-the-config path; widening the predicate here makes it fire.
+        if not row_assignee or row_assignee.strip() == "default":
             # Honour kanban.default_assignee: when the dispatcher hits an
             # unassigned ready task and an operator-configured fallback
             # exists, persist the assignment and proceed. This removes the
@@ -9744,7 +10010,7 @@ def _dispatch_once_locked(
                         with write_txn(conn):
                             conn.execute(
                                 "UPDATE tasks SET assignee = ? WHERE id = ? "
-                                "AND (assignee IS NULL OR assignee = '')",
+                                "AND (assignee IS NULL OR assignee = '' OR assignee = 'default')",
                                 (_default_assignee, row["id"]),
                             )
                             _append_event(

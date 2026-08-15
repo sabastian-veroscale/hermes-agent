@@ -1114,6 +1114,29 @@ def create_child_with_sticky_block(
     # "the ship card's sticky block is applied ONLY if the reused ship card
     # is not already blocked"). Skip the block in that case.
     parents_for_create: tuple = tuple(real_parent_ids) if not planned.ship_block_kind else ()
+    # Inherit model/provider override from the first real parent that has
+    # one set. Without this, every workflow child falls back to the
+    # assignee profile's default model — burning the user's interactive
+    # quota (terra/luna/grok) when the root was pinned to a cheap bulk
+    # model like MiniMax-M3. See incident 2026-08-10 t_27793210.
+    inherited_model_override: Optional[str] = None
+    inherited_provider_override: Optional[str] = None
+    if real_parent_ids:
+        parent_row = conn.execute(
+            "SELECT model_override, provider_override FROM tasks "
+            "WHERE id IN ({}) AND model_override IS NOT NULL "
+            "ORDER BY id LIMIT 1".format(
+                ",".join("?" for _ in real_parent_ids)
+            ),
+            tuple(real_parent_ids),
+        ).fetchone()
+        if parent_row is not None:
+            inherited_model_override = (
+                (parent_row["model_override"] or "").strip() or None
+            )
+            inherited_provider_override = (
+                (parent_row["provider_override"] or "").strip() or None
+            )
     with kb.write_txn(conn):
         task_id = create_task(
             conn,
@@ -1128,6 +1151,8 @@ def create_child_with_sticky_block(
             initial_status=planned.initial_status,
             workflow_template_id=planned.workflow_template_id,
             current_step_key=planned.step_key,
+            model_override=inherited_model_override,
+            provider_override=inherited_provider_override,
         )
         if planned.ship_block_kind:
             # Look up the existing card's status. If it's already sticky-blocked
