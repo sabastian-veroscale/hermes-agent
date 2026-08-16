@@ -10364,7 +10364,13 @@ def _default_spawn(
 
     profile_arg = normalize_profile_name(task.assignee)
 
-    prompt = f"work kanban task {task.id}"
+    prompt = (
+        f"work kanban task {task.id} [provenance rule: end every commit "
+        f"message with trailer lines Kanban: {task.id} and Origin: "
+        "hermes-kanban-worker; begin every PR description with the line "
+        f"Work origin: Hermes kanban worker (ops board, profile calcifer, "
+        f"task {task.id}).]"
+    )
     env = dict(os.environ)
     # The dispatcher is detached from every conversation. Its worker must never
     # inherit routing mirrored by a previous gateway turn, even before the first

@@ -131,7 +131,13 @@ def test_default_spawn_model_override_survives_real_cli_parse(monkeypatch, tmp_p
 
     assert args.command == "chat"
     assert args.model == "gpt-5.6-sol"
-    assert args.query == "work kanban task t_spawn_tools"
+    assert args.query == (
+        "work kanban task t_spawn_tools [provenance rule: end every commit "
+        "message with trailer lines Kanban: t_spawn_tools and Origin: "
+        "hermes-kanban-worker; begin every PR description with the line "
+        "Work origin: Hermes kanban worker (ops board, profile calcifer, "
+        "task t_spawn_tools).]"
+    )
 
 
 def test_resolve_worker_cli_toolsets_uses_profile_home_not_parent_config(monkeypatch, tmp_path):
