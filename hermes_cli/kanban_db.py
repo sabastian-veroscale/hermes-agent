@@ -10401,6 +10401,12 @@ def _default_spawn(
         env["HERMES_TENANT"] = task.tenant
     env["HERMES_KANBAN_TASK"] = task.id
     env["HERMES_KANBAN_WORKSPACE"] = workspace
+    # Fleet author identity: every git commit made by a dispatcher-spawned
+    # worker carries author/committer name "hermes-fleet" so `git log` shows
+    # fleet provenance at a glance. Email is left untouched (keeps GitHub
+    # account attribution on the operator's account).
+    env["GIT_AUTHOR_NAME"] = "hermes-fleet"
+    env["GIT_COMMITTER_NAME"] = "hermes-fleet"
     # Tag the worker's session so it lands in state.db as `kanban`, not as an
     # untitled `cli` row. A worker is a dispatcher-owned run whose transcript is
     # read on the board and in `hermes kanban log` — it is not a conversation
