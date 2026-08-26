@@ -1112,22 +1112,77 @@ def _coerce_boolean(value: str):
     return value
 
 
+# Upper bound on the diagnostic text handed to ``post_tool_call`` listeners.
+# Deliberately generous next to the CLI's 48-char display suffix
+# (``agent.display._ERROR_SUFFIX_MAX_LEN``): observers are machines, not a
+# one-line status bar, and downstream consumers apply their own caps (the
+# friction-capture hook truncates at 4000).
+_OBSERVER_ERROR_MAX_LEN = 2000
+
+# Result keys inspected, in order, for a diagnostic payload when a failing
+# result carries no structured ``error``. ``terminal`` merges stderr into
+# ``output``; other backends may surface ``stderr``/``stdout`` separately.
+_OBSERVER_DETAIL_KEYS = ("error", "stderr", "output", "stdout")
+
+
+def _observer_error_detail(parsed: Any, suffix: str) -> Optional[str]:
+    """Return a diagnostic ``error_message`` for ``post_tool_call`` listeners.
+
+    ``agent.display._detect_tool_failure`` returns a *display* suffix that is
+    intentionally short (48 chars) because it is appended to a one-line CLI
+    status. For a ``terminal`` failure whose result carries ``error: null`` —
+    the normal shape when a command runs fine but exits non-zero — that suffix
+    degrades to bare ``"exit <code>"``: no command, no stderr, no cwd. Handing
+    that to an automated observer is lossy, and it is what produced a
+    content-free ``exit 128`` friction card (kanban t_a86ca0ea) whose real
+    diagnostic (``fatal: '<branch>' is already used by worktree at '<path>'``)
+    was sitting unread in the result's ``output``.
+
+    Observers get the real payload instead: the first non-empty field of
+    :data:`_OBSERVER_DETAIL_KEYS`, tail-truncated (command diagnostics surface
+    at the END of output) and prefixed with the exit code so the numeric signal
+    survives. Falls back to the display suffix when no usable text exists, so
+    behavior is never worse than before.
+    """
+    fallback = suffix.strip().strip("[]") or None
+    if not isinstance(parsed, dict):
+        return fallback
+
+    for key in _OBSERVER_DETAIL_KEYS:
+        text = parsed.get(key)
+        if not isinstance(text, str) or not text.strip():
+            continue
+        detail = text.strip()
+        if len(detail) > _OBSERVER_ERROR_MAX_LEN:
+            # Keep the tail: the operative error is almost always last.
+            detail = "\u2026" + detail[-(_OBSERVER_ERROR_MAX_LEN - 1):]
+        exit_code = parsed.get("exit_code")
+        if isinstance(exit_code, int) and exit_code != 0:
+            # Prefix after truncation so the exit code can never be cut.
+            detail = f"exit {exit_code}: {detail}"
+        return detail
+    return fallback
+
+
 def _tool_result_observer_fields(
     tool_name: str,
     result: Any,
 ) -> tuple[str, Optional[str], Optional[str]]:
+    parsed_result: Any = None
     try:
         parsed_result = json.loads(result) if isinstance(result, str) else result
         if isinstance(parsed_result, dict) and parsed_result.get("error"):
             return "error", "tool_error", str(parsed_result.get("error"))
     except Exception:
-        pass
+        parsed_result = None
     try:
         from agent.display import _detect_tool_failure
 
         failed, suffix = _detect_tool_failure(tool_name, result)
         if failed:
-            return "error", "tool_error", suffix.strip().strip("[]") or None
+            return "error", "tool_error", _observer_error_detail(
+                parsed_result, suffix,
+            )
     except Exception:
         pass
     return "ok", None, None

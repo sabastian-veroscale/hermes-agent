@@ -77,6 +77,119 @@ class TestHandleFunctionCall:
             assert kwargs_by_hook[hook_name]["error_type"] == "tool_error"
             assert kwargs_by_hook[hook_name]["error_message"] == "exit 1"
 
+    def test_terminal_failure_forwards_output_diagnostic_not_bare_exit_code(self):
+        """Regression (kanban t_a86ca0ea): a ``terminal`` failure whose result
+        carries ``error: null`` must forward the real diagnostic text to
+        ``post_tool_call`` observers, not the bare ``"exit <code>"`` display
+        suffix.
+
+        Repro that produced the bug: ``git checkout <branch>`` for a branch
+        already checked out in another worktree exits 128 and prints its
+        ``fatal:`` line to stderr, which the terminal tool merges into
+        ``output`` while leaving ``error`` as ``None``. The observer previously
+        received the 8-character string ``"exit 128"``, so the automated
+        friction card had no command, no stderr and no path in it.
+        """
+        fatal = (
+            "fatal: 'fix/some-branch' is already used by worktree at "
+            "'/Users/x/Github/some-worktree'"
+        )
+        result = json.dumps({"output": fatal, "exit_code": 128, "error": None})
+        with (
+            patch("model_tools.registry.dispatch", return_value=result),
+            patch("hermes_cli.plugins.has_hook", return_value=True),
+            patch("hermes_cli.plugins.invoke_hook") as mock_invoke_hook,
+        ):
+            handle_function_call("terminal", {"command": "git checkout x"})
+
+        kwargs_by_hook = {
+            hook.args[0]: hook.kwargs for hook in mock_invoke_hook.call_args_list
+        }
+        for hook_name in ("post_tool_call", "transform_tool_result"):
+            msg = kwargs_by_hook[hook_name]["error_message"]
+            assert kwargs_by_hook[hook_name]["status"] == "error"
+            # The numeric signal survives...
+            assert "exit 128" in msg
+            # ...and so does the actual diagnostic that explains it.
+            assert "already used by worktree" in msg
+            assert "fix/some-branch" in msg
+            # The old lossy behavior must not come back.
+            assert msg != "exit 128"
+
+    def test_terminal_failure_prefers_structured_error_over_output(self):
+        """A structured ``error`` field still wins — it is the tool's own
+        curated message and short-circuits before the display-suffix path.
+        """
+        result = json.dumps({
+            "output": "noise on stdout",
+            "exit_code": 2,
+            "error": "Command timed out after 180 seconds",
+        })
+        with (
+            patch("model_tools.registry.dispatch", return_value=result),
+            patch("hermes_cli.plugins.has_hook", return_value=True),
+            patch("hermes_cli.plugins.invoke_hook") as mock_invoke_hook,
+        ):
+            handle_function_call("terminal", {"command": "sleep 999"})
+
+        kwargs = {
+            h.args[0]: h.kwargs for h in mock_invoke_hook.call_args_list
+        }["post_tool_call"]
+        assert kwargs["error_message"] == "Command timed out after 180 seconds"
+
+    def test_observer_error_detail_truncates_from_the_tail(self):
+        """Long output is tail-truncated (the operative error is last) and the
+        exit-code prefix is applied AFTER truncation so it can never be cut.
+        """
+        from model_tools import _OBSERVER_ERROR_MAX_LEN, _observer_error_detail
+
+        needle = "fatal: the real problem is here"
+        parsed = {
+            "output": ("x" * (_OBSERVER_ERROR_MAX_LEN * 2)) + needle,
+            "exit_code": 128,
+            "error": None,
+        }
+        detail = _observer_error_detail(parsed, " [exit 128]")
+
+        assert detail is not None
+        assert detail.startswith("exit 128: ")
+        assert detail.endswith(needle)
+        assert "\u2026" in detail  # ellipsis marks the elided head
+        body = detail[len("exit 128: "):]
+        assert len(body) == _OBSERVER_ERROR_MAX_LEN
+
+    def test_observer_error_detail_falls_back_to_display_suffix(self):
+        """No usable text anywhere -> keep the old display suffix, so the fix
+        can never make the observer payload *worse* than before.
+        """
+        from model_tools import _observer_error_detail
+
+        assert _observer_error_detail(
+            {"output": "", "exit_code": 128, "error": None}, " [exit 128]",
+        ) == "exit 128"
+        assert _observer_error_detail(
+            {"output": "   ", "exit_code": 1, "error": None}, " [exit 1]",
+        ) == "exit 1"
+        # Non-dict parse result (unparseable JSON) also falls back.
+        assert _observer_error_detail(None, " [exit 128]") == "exit 128"
+        # Nothing to report at all -> None, not an empty string.
+        assert _observer_error_detail(None, " []") is None
+
+    def test_observer_error_detail_uses_stderr_when_output_empty(self):
+        """Backends that keep stderr separate from stdout are still covered."""
+        from model_tools import _observer_error_detail
+
+        detail = _observer_error_detail(
+            {
+                "output": "",
+                "stderr": "permission denied: ./deploy.sh",
+                "exit_code": 126,
+                "error": None,
+            },
+            " [exit 126]",
+        )
+        assert detail == "exit 126: permission denied: ./deploy.sh"
+
     def test_no_listener_skips_post_and_transform_emit(self):
         """When no plugin is registered for post_tool_call /
         transform_tool_result, the emit path must short-circuit on
