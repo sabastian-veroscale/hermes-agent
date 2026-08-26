@@ -2940,18 +2940,32 @@ def terminal_tool(
 
         # Reject foreground commands where the model explicitly requests
         # a timeout above FOREGROUND_MAX_TIMEOUT — nudge it toward background.
+        # The envelope shape MUST match the background-guidance envelope below:
+        # ``output`` (empty string), ``exit_code`` (-1), ``error`` (actionable
+        # prose), ``status`` ("error"). Earlier versions returned only ``error``
+        # via tool_error(), which is asymmetric and caused V8 timeout rejections
+        # to misclassify as "the tool gave us nothing" in downstream observers
+        # (kanban t_96f871c9). See test_terminal_foreground_amp_regression.py.
         if not background and timeout and timeout > FOREGROUND_MAX_TIMEOUT:
-            return tool_error(
+            timeout_msg = (
                 f"Foreground timeout {timeout}s exceeds the maximum of "
                 f"{FOREGROUND_MAX_TIMEOUT}s. Use background=true with "
                 f"notify_on_complete=true for long-running commands."
             )
+            logger.info("rejected foreground timeout: %s", timeout_msg)
+            return json.dumps({
+                "output": "",
+                "exit_code": -1,
+                "error": timeout_msg,
+                "status": "error",
+            }, ensure_ascii=False)
 
         # Guardrail: long-lived server/watch commands should run as managed
         # background sessions, not foreground shell hacks.
         if not background:
             guidance = _foreground_background_guidance(command)
             if guidance:
+                logger.info("rejected foreground background: %s", guidance)
                 return json.dumps({
                     "output": "",
                     "exit_code": -1,
