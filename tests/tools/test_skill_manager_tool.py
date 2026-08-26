@@ -1003,3 +1003,149 @@ class TestCuratorConsolidationDeleteGuard:
             assert allowed["success"] is True, allowed
 
         _reset_background_review_read_marks()
+
+
+# ---------------------------------------------------------------------------
+# Missing-skill guard: closest-match suggestion in _skill_not_found_error
+#
+# Regression for t_1636b4c2 / FRX kanban-patch-t_25ea98ce: a calcifer-profile
+# agent called ``skill_manage(action='view', name='kanban-patch-t_25ea98c')``
+# (typo, missing the final 'e').  The legacy message was the bare
+# "Use skills_list() to see available skills" hint with no concrete next
+# step, which is a failure mode for typo recovery: the agent has to fall
+# back to listing every skill by hand instead of being told what it
+# probably meant.
+#
+# These tests lock in the upgraded contract: when no exact cross-profile
+# match exists, the error message must suggest up to three close-match
+# candidates pulled from the live skill inventory, and must fall back to
+# the legacy line only when nothing is similar.
+# ---------------------------------------------------------------------------
+
+
+class TestSkillNotFoundError:
+    """Lock in the t_1636b4c2 / FRX kanban-patch-t_25ea98ce contract.
+
+    Each test isolates SKILLS_DIR + get_all_skills_dirs to a tmp_path so
+    the discovery walk only sees fixtures below — never the live
+    ~/.hermes/skills/ tree, which would make the assertions depend on the
+    user's local skill set.
+    """
+
+    def _make_skill(self, tmp_path: Path, name: str) -> Path:
+        skill = tmp_path / name
+        skill.mkdir()
+        (skill / "SKILL.md").write_text(
+            f"---\nname: {name}\ndescription: fixture for t_1636b4c2 typo test.\n---\n\nfoo\n",
+            encoding="utf-8",
+        )
+        return skill
+
+    def test_typo_single_char_diff_suggests_close_match(self, tmp_path):
+        """Single-character typo recovers via 'Did you mean ...?'."""
+        self._make_skill(tmp_path, "kanban-patch-t_25ea98ce")
+        with _skill_dir(tmp_path):
+            from tools.skill_manager_tool import _skill_not_found_error
+            msg = _skill_not_found_error("kanban-patch-t_25ea98c")
+        assert "kanban-patch-t_25ea98ce" in msg, msg
+        assert "Did you mean" in msg, msg
+        # Suffix-less variant for 'patch': legacy hint must NOT appear when a match was found
+        assert "Use skills_list() to see available skills" not in msg, msg
+
+    def test_typo_multiple_candidates_listed(self, tmp_path):
+        """When several skills are close, all of them are surfaced."""
+        # difflib's default cutoff is 0.6 (ratio = 2*M / T1+T2), so two
+        # candidates with >= ~67% overlap must be selected.  These three
+        # cluster around the typo target well above 0.6.
+        self._make_skill(tmp_path, "alpha-skill-one")
+        self._make_skill(tmp_path, "alpha-skill-two")
+        self._make_skill(tmp_path, "alpha-skill-zzz")
+        with _skill_dir(tmp_path):
+            from tools.skill_manager_tool import _skill_not_found_error
+            msg = _skill_not_found_error("alpha-skill-xyz")
+        # Plurality path: more than one match → "one of:" wrapper.
+        assert "Did you mean" in msg, msg
+        assert "one of:" in msg, msg
+        # At least two close matches must be returned (the cap n=3 is
+        # the upper bound; difflib returns what's above 0.6).
+        present = [s for s in ("alpha-skill-one", "alpha-skill-two", "alpha-skill-zzz") if s in msg]
+        assert len(present) >= 2, (present, msg)
+
+    def test_completely_unrelated_skill_falls_back_to_legacy_hint(self, tmp_path):
+        """No close matches → keep the legacy 'Use skills_list()' line."""
+        self._make_skill(tmp_path, "apple-notes")
+        with _skill_dir(tmp_path):
+            from tools.skill_manager_tool import _skill_not_found_error
+            msg = _skill_not_found_error("completely-unrelated-typo")
+        assert "completely-unrelated-typo" in msg, msg
+        assert "Use skills_list() to see available skills" in msg, msg
+        # Typos that produced no match must not produce a "Did you mean"
+        # phantom — that would mislead the agent.
+        assert "Did you mean" not in msg, msg
+
+    def test_suffix_is_appended_after_match_hint(self, tmp_path):
+        """Action-specific suffix lands after the match hint, not before."""
+        self._make_skill(tmp_path, "kanban-patch-t_25ea98ce")
+        with _skill_dir(tmp_path):
+            from tools.skill_manager_tool import _skill_not_found_error
+            msg = _skill_not_found_error(
+                "kanban-patch-t_25ea98c",
+                " Create it first with action='create'.",
+            )
+        assert msg.endswith(" Create it first with action='create'."), msg
+        # The match hint is between the error and the suffix.
+        assert msg.find("kanban-patch-t_25ea98ce") < msg.find(
+            "Create it first with action='create'"
+        ), msg
+
+    def test_empty_name_does_not_crash(self, tmp_path):
+        """Defensive: empty name must not crash discovery."""
+        with _skill_dir(tmp_path):
+            from tools.skill_manager_tool import _skill_not_found_error
+            msg = _skill_not_found_error("")
+        # Either the legacy hint OR a match-suggestion is acceptable,
+        # but it must not raise and must contain SOMETHING useful.
+        assert msg, "_skill_not_found_error returned empty string"
+        assert "not found in active profile" in msg, msg
+
+    def test_closest_skill_matches_helper_limits_n(self, tmp_path):
+        """Unit test for the helper: respects n=3 cap, drops zero-similarity."""
+        self._make_skill(tmp_path, "alpha-skill")
+        self._make_skill(tmp_path, "alpha-twin")
+        self._make_skill(tmp_path, "alpha-mate")
+        self._make_skill(tmp_path, "completely-different-thing")
+        with _skill_dir(tmp_path):
+            from tools.skill_manager_tool import _closest_skill_matches
+            matches = _closest_skill_matches("alpha", n=3)
+            assert len(matches) <= 3, matches
+            # All returned names contain 'alpha' (similarity dominance)
+            assert all("alpha" in m for m in matches), matches
+            # No match for unrelated input
+            assert _closest_skill_matches("xyzzy-novel-string") == []
+
+    def test_closest_skill_matches_helper_handles_unicode_path(self, tmp_path):
+        """Skip: the legacy lib cuts off cleanly on non-ascii — verify
+        the wrapper returns ``[]`` rather than raising."""
+        self._make_skill(tmp_path, "alpha-skill")
+        with _skill_dir(tmp_path):
+            from tools.skill_manager_tool import _closest_skill_matches
+            # Empty / None inputs
+            assert _closest_skill_matches("") == []
+            # No exception on weird names
+            _ = _closest_skill_matches("\x00\x01\x02")
+
+    def test_collect_all_skill_names_returns_unique_names(self, tmp_path):
+        """Names must be deduplicated across same-name skills under different
+        categories (e.g. two ``foo/SKILL.md`` files sharing parent name)."""
+        self._make_skill(tmp_path, "dup-name")
+        skill2 = tmp_path / "category-a" / "dup-name"
+        skill2.mkdir(parents=True)
+        (skill2 / "SKILL.md").write_text(
+            "---\nname: dup-name\ndescription: dup under category.\n---\n\nx\n",
+            encoding="utf-8",
+        )
+        with _skill_dir(tmp_path):
+            from tools.skill_manager_tool import _collect_all_skill_names
+            names = _collect_all_skill_names()
+        assert names.count("dup-name") == 1, names
+        assert "dup-name" in names, names

@@ -838,12 +838,83 @@ def _find_skill_in_other_profiles(name: str) -> List[Tuple[str, Path]]:
     return matches
 
 
-def _skill_not_found_error(name: str, suffix: str = "") -> str:
-    """Build a "skill not found" error that names other profiles holding
-    the same skill, so the agent can recognize a profile-scoping mistake.
+def _collect_all_skill_names() -> List[str]:
+    """Return the names of every skill discoverable via ``get_all_skills_dirs``.
 
-    ``suffix`` is appended after the cross-profile hint if present
-    (e.g. ``" Create it first with action='create'."``).
+    Walks the same roots that ``_find_skill`` searches (local skills dir plus
+    any ``skills.external_dirs`` entries), then deduplicates on directory
+    name.  Used by ``_skill_not_found_error`` to suggest close matches when
+    the agent's call has a typo — much more useful than a bare
+    "Use skills_list() to see available skills" hint.
+
+    Failure-quiet by contract: any IO/import error yields an empty list so
+    the surrounding error message stays informative even when the filesystem
+    is unavailable.
+    """
+    try:
+        from agent.skill_utils import get_all_skills_dirs, is_excluded_skill_path
+    except Exception:
+        return []
+    names: List[str] = []
+    seen: set = set()
+    try:
+        for skills_dir in get_all_skills_dirs():
+            if not skills_dir.exists():
+                continue
+            for skill_md in skills_dir.rglob("SKILL.md"):
+                try:
+                    if is_excluded_skill_path(skill_md):
+                        continue
+                except Exception:
+                    pass
+                parent_name = skill_md.parent.name
+                if parent_name in seen:
+                    continue
+                seen.add(parent_name)
+                names.append(parent_name)
+    except OSError:
+        pass
+    return names
+
+
+def _closest_skill_matches(name: str, n: int = 3) -> List[str]:
+    """Return up to ``n`` existing skill names closest to ``name``.
+
+    Uses ``difflib.get_close_matches`` (Python stdlib, no extra cost) over
+    the union of every discoverable skill directory — the same surfaces an
+    agent could plausibly have meant when it asks about ``name``.  Empty
+    list on no input, on nothing similar, or on any enumeration failure.
+
+    ``cutoff`` is set to 0.6 (lib default) so single-character flips in long
+    names still surface: ``get_close_matches('kanban-patch-t_25ea98c',
+    candidates, n=3)`` will return ``['kanban-patch-t_25ea98ce']`` even
+    though the strings differ by only one character at the tail.
+    """
+    if not name:
+        return []
+    candidates = _collect_all_skill_names()
+    if not candidates:
+        return []
+    try:
+        import difflib
+        matches = difflib.get_close_matches(name, candidates, n=n)
+    except Exception:
+        return []
+    return matches
+
+
+def _skill_not_found_error(name: str, suffix: str = "") -> str:
+    """Build a "skill not found" error that:
+
+      * names the active profile (so a cross-profile mistake is obvious),
+      * names other profiles holding the same skill (so a profile-scoping
+        mistake is obvious),
+      * surfaces up to 3 close-match candidates for typo recovery, and
+      * keeps the legacy ``"Use skills_list()"`` fallback for cases where
+        nothing else helps.
+
+    ``suffix`` is appended last (e.g. ``" Create it first with
+    action='create'."``) so the caller can attach action-specific guidance.
     """
     from agent.file_safety import _resolve_active_profile_name
     active = _resolve_active_profile_name()
@@ -868,7 +939,25 @@ def _skill_not_found_error(name: str, suffix: str = "") -> str:
                 f"operate via explicit file tools with ``cross_profile=True``."
             )
     else:
-        base += " Use skills_list() to see available skills."
+        # No exact cross-profile match — surface typo-recovery candidates
+        # before falling back to the legacy "use skills_list()" hint.  When
+        # nothing is close, we still emit the legacy line so the message
+        # remains informative on a totally unknown skill name.
+        matches = _closest_skill_matches(name)
+        if matches:
+            if len(matches) == 1:
+                base += (
+                    f" Did you mean '{matches[0]}'? "
+                    f"If so, retry with name='{matches[0]}'."
+                )
+            else:
+                quoted = ", ".join(f"'{m}'" for m in matches)
+                base += (
+                    f" Did you mean one of: {quoted}? "
+                    f"Retry with the exact name from this list."
+                )
+        else:
+            base += " Use skills_list() to see available skills."
 
     if suffix:
         base += suffix
