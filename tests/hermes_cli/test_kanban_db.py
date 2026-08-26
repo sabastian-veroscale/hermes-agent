@@ -571,6 +571,149 @@ def test_worktree_workspace_explicit_target_materializes_linked_worktree(kanban_
 
 
 # ---------------------------------------------------------------------------
+# Scratch workspace git init (#t_f4ef6267)
+# ---------------------------------------------------------------------------
+
+
+
+def test_scratch_workspace_is_initialized_as_git_repo(kanban_home):
+    """A newly-resolved scratch workspace must be a valid git working tree.
+
+    Regression for the ``fatal: not a git repository`` exit-128 reported on
+    ``t_79e8c61b``: scratch workspaces were created as plain dirs and any
+    worker that assumed git semantics failed immediately. Now
+    ``resolve_workspace`` materializes them as a git repo (initial commit,
+    clean tree, local-only identity) so workers can ``git status`` /
+    ``git diff`` / ``git commit`` from the start.
+    """
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="scratch needs git")
+        task = kb.get_task(conn, t)
+        ws = kb.resolve_workspace(task)
+
+    assert ws.exists()
+    # ``git rev-parse --is-inside-work-tree`` returns 0 + stdout 'true'.
+    probe = subprocess.run(
+        ["git", "-C", str(ws), "rev-parse", "--is-inside-work-tree"],
+        check=False, capture_output=True, text=True,
+    )
+    assert probe.returncode == 0, probe.stderr
+    assert probe.stdout.strip() == "true"
+
+    # Clean tree: nothing untracked, nothing modified — the init commit
+    # must include the .gitignore so ``git status`` doesn't show noise on
+    # a fresh workspace.
+    status = subprocess.run(
+        ["git", "-C", str(ws), "status", "--porcelain"],
+        check=False, capture_output=True, text=True,
+    )
+    assert status.returncode == 0, status.stderr
+    assert status.stdout.strip() == "", (
+        f"expected a clean working tree after init, got:\n{status.stdout}"
+    )
+
+    # Local-only identity — scratch repos are ephemeral and must not leak
+    # the host's global user.email into a commit author.
+    email = subprocess.run(
+        ["git", "-C", str(ws), "config", "--get", "user.email"],
+        check=False, capture_output=True, text=True,
+    )
+    name = subprocess.run(
+        ["git", "-C", str(ws), "config", "--get", "user.name"],
+        check=False, capture_output=True, text=True,
+    )
+    assert email.stdout.strip() == "hermes@local"
+    assert name.stdout.strip() == "Hermes"
+
+
+def test_scratch_workspace_git_init_self_heals_legacy_empty_dir(kanban_home):
+    """``_ensure_git_repo`` must heal a pre-existing empty scratch dir.
+
+    Regression for the migration gap: legacy workspaces created before this
+    fix are plain empty dirs. The first worker to claim such a task sees
+    ``git -C <ws> status`` exit 128 — exactly the failure on
+    ``t_79e8c61b``. ``resolve_workspace`` must initialize those dirs in
+    place so workers that pick them up get a valid repo.
+    """
+    # Drop a legacy-style empty scratch dir directly under the workspaces
+    # root, exactly like the buggy dispatcher did before this fix.
+    legacy_ws = kb.workspaces_root() / "t_legacy"
+    legacy_ws.mkdir(parents=True, exist_ok=True)
+    # Sanity: this dir is NOT yet a git repo.
+    pre = subprocess.run(
+        ["git", "-C", str(legacy_ws), "rev-parse", "--is-inside-work-tree"],
+        check=False, capture_output=True, text=True,
+    )
+    assert pre.returncode != 0, "legacy dir must start as a non-git dir"
+
+    # Now wire that path onto a fresh task and resolve — this is the
+    # self-heal path for an already-existing broken workspace.
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="legacy scratch")
+        # Force the legacy path onto this scratch task so resolve_workspace
+        # sees a pre-existing empty dir (mirrors what the migration hits).
+        kb.set_workspace_path(conn, t, legacy_ws)
+        task = kb.get_task(conn, t)
+        assert task is not None and task.workspace_path == str(legacy_ws)
+        ws = kb.resolve_workspace(task)
+
+    assert ws == legacy_ws
+    post = subprocess.run(
+        ["git", "-C", str(ws), "rev-parse", "--is-inside-work-tree"],
+        check=False, capture_output=True, text=True,
+    )
+    assert post.returncode == 0, post.stderr
+    assert post.stdout.strip() == "true"
+
+    # Idempotent: calling resolve_workspace again must not corrupt the repo.
+    with kb.connect() as conn:
+        task2 = kb.get_task(conn, t)
+        ws2 = kb.resolve_workspace(task2)
+    assert ws2 == ws
+    log_after = subprocess.run(
+        ["git", "-C", str(ws2), "log", "--oneline"],
+        check=False, capture_output=True, text=True,
+    )
+    assert log_after.returncode == 0
+    # Exactly one commit (the init commit) — a second resolve must not
+    # produce a duplicate commit, which would muddy provenance.
+    assert len(log_after.stdout.strip().splitlines()) == 1
+
+
+def test_ensure_git_repo_is_noop_when_already_a_git_repo(kanban_home, tmp_path):
+    """``_ensure_git_repo`` must leave an existing git repo alone."""
+    # Make an unrelated repo inside tmp_path (NOT under workspaces_root),
+    # then call _ensure_git_repo on it and assert log is unchanged.
+    repo = tmp_path / "preexisting"
+    _init_git_repo(repo)
+    log_before = subprocess.run(
+        ["git", "-C", str(repo), "log", "--oneline"],
+        check=True, capture_output=True, text=True,
+    ).stdout
+
+    assert kb._ensure_git_repo(repo) is True
+    log_after = subprocess.run(
+        ["git", "-C", str(repo), "log", "--oneline"],
+        check=True, capture_output=True, text=True,
+    ).stdout
+    assert log_after == log_before, "_ensure_git_repo must not touch existing repos"
+
+
+def test_ensure_git_repo_gracefully_handles_missing_git_binary(
+    kanban_home, tmp_path, monkeypatch,
+):
+    """When ``git`` is unavailable, the workspace is still created — just not versioned."""
+    target = tmp_path / "scratch-no-git"
+    target.mkdir(parents=True, exist_ok=True)
+    # Force shutil.which("git") to return None to simulate a git-less host.
+    monkeypatch.setattr(kb.shutil, "which", lambda _name: None)
+    assert kb._ensure_git_repo(target) is False
+    # The dir still exists; just isn't a repo.
+    assert target.exists()
+    assert not kb._is_inside_git_work_tree(target)
+
+
+# ---------------------------------------------------------------------------
 # Scratch cleanup containment (#28818)
 # ---------------------------------------------------------------------------
 

@@ -7692,6 +7692,125 @@ def _is_linked_worktree_checkout(path: Path) -> bool:
     return git_dir != common_dir
 
 
+def _is_inside_git_work_tree(path: Path) -> bool:
+    """Return True if ``path`` lives inside any git working tree.
+
+    Used as a self-heal guard: legacy scratch dirs pre-dating this fix are
+    plain empty dirs, and ``git -C <path> status`` exits 128 with
+    ``fatal: not a git repository`` — which breaks every agent that assumes
+    a git workspace. Re-running ``_ensure_git_repo`` on those dirs recovers
+    them on next use.
+    """
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(path), "rev-parse", "--is-inside-work-tree"],
+            capture_output=True,
+            text=True, encoding='utf-8', errors='replace',
+            timeout=30,
+            check=False,
+        )
+    except Exception:
+        return False
+    return result.returncode == 0 and (result.stdout or "").strip() == "true"
+
+
+def _ensure_git_repo(path: Path) -> bool:
+    """Materialize ``path`` as a git working tree, idempotently.
+
+    Returns ``True`` when ``path`` ends up inside a git work tree after
+    this call, ``False`` when git is unavailable or init failed (we log
+    and continue rather than crashing — the directory itself is still
+    usable, just not versioned).
+
+    Behavior:
+
+    * If ``path`` is already inside a git work tree (e.g. a legacy scratch
+      dir that another fix initialized, or a caller-supplied dir that
+      happens to sit inside a parent repo), this is a no-op — that's the
+      self-heal guard for the original bug.
+    * Otherwise we ``git init -q`` in place, set a local identity
+      (``hermes@local`` / ``Hermes``) so subsequent ``commit`` calls don't
+      fail with ``Author identity unknown``, drop a minimal ``.gitignore``
+      that ignores ``.hermes/`` scratch state, and commit it. The initial
+      commit leaves ``git status`` reporting a clean tree, so a worker's
+      first ``git status`` doesn't see spurious untracked noise.
+    """
+    if not path.exists():
+        return False
+    if _is_inside_git_work_tree(path):
+        # Self-heal: already a git repo (legacy dir, parent repo, or
+        # previously-init'd workspace). Leave it alone.
+        return True
+    git = shutil.which("git")
+    if git is None:
+        _log.warning(
+            "git binary not found; scratch workspace %s will not be a git repo. "
+            "Workers that assume git semantics may fail here.",
+            path,
+        )
+        return False
+    try:
+        env = dict(os.environ)
+        # Avoid the host's GIT_DIR / GIT_WORK_TREE leaking into a fresh repo.
+        env.pop("GIT_DIR", None)
+        env.pop("GIT_WORK_TREE", None)
+        subprocess.run(
+            [git, "-C", str(path), "init", "-q", "-b", "main"],
+            capture_output=True, text=True, encoding='utf-8', errors='replace',
+            timeout=30, check=False, env=env,
+        )
+        # Local-only identity: scratch repos are ephemeral and must never
+        # leak the host's global user.email/Name into a commit author.
+        subprocess.run(
+            [git, "-C", str(path), "config", "--local", "user.email", "hermes@local"],
+            capture_output=True, text=True, encoding='utf-8', errors='replace',
+            timeout=30, check=False, env=env,
+        )
+        subprocess.run(
+            [git, "-C", str(path), "config", "--local", "user.name", "Hermes"],
+            capture_output=True, text=True, encoding='utf-8', errors='replace',
+            timeout=30, check=False, env=env,
+        )
+        # Default branch name on older git (no -b support above): rename to main.
+        # ``-b main`` is preferred when supported, so this is a fallback only.
+        current_branch_proc = subprocess.run(
+            [git, "-C", str(path), "branch", "--show-current"],
+            capture_output=True, text=True, encoding='utf-8', errors='replace',
+            timeout=30, check=False, env=env,
+        )
+        if current_branch_proc.returncode == 0:
+            current_branch = (current_branch_proc.stdout or "").strip()
+            if current_branch and current_branch not in ("main", "master"):
+                subprocess.run(
+                    [git, "-C", str(path), "branch", "-m", "main"],
+                    capture_output=True, text=True, encoding='utf-8', errors='replace',
+                    timeout=30, check=False, env=env,
+                )
+        gitignore = path / ".gitignore"
+        if not gitignore.exists():
+            gitignore.write_text(
+                "# Hermes kanban scratch workspace\n"
+                "# Ignore Hermes' own ephemeral state — workers shouldn't see\n"
+                "# it in `git status`. Don't ignore content the worker creates.\n"
+                ".hermes/\n",
+                encoding="utf-8",
+            )
+        subprocess.run(
+            [git, "-C", str(path), "add", ".gitignore"],
+            capture_output=True, text=True, encoding='utf-8', errors='replace',
+            timeout=30, check=False, env=env,
+        )
+        subprocess.run(
+            [git, "-C", str(path), "commit", "-q", "-m", "init workspace"],
+            capture_output=True, text=True, encoding='utf-8', errors='replace',
+            timeout=30, check=False, env=env,
+        )
+    except Exception as exc:
+        _log.warning("Failed to initialize git repo in %s: %s", path, exc)
+        return False
+    return _is_inside_git_work_tree(path)
+
+
 def _nearest_existing_path(path: Path) -> Path:
     current = path
     while not current.exists() and current != current.parent:
@@ -7870,6 +7989,16 @@ def resolve_workspace(task: Task, *, board: Optional[str] = None) -> Path:
         else:
             p = workspaces_root(board=board) / task.id
         p.mkdir(parents=True, exist_ok=True)
+        # Scratch workspaces live under ``<board>/workspaces/<task_id>`` —
+        # brand-new dirs that Hermes owns. Materialize them as git repos so
+        # workers that assume git semantics (status, diff, log, commit) get
+        # a valid working tree instead of the
+        # ``fatal: not a git repository`` exit-128. ``_ensure_git_repo`` is
+        # idempotent: legacy dirs that pre-date this fix (or dirs that
+        # another component already initialized) are detected via
+        # ``git rev-parse --is-inside-work-tree`` and left alone — that's
+        # the self-heal path for any already-existing broken workspace.
+        _ensure_git_repo(p)
         return p
     if kind == "dir":
         if not task.workspace_path:
