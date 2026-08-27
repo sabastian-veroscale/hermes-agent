@@ -8225,6 +8225,82 @@ _RECENT_WORKER_EXIT_TTL_SECONDS = 600
 _RECENT_WORKER_EXITS_MAX = 4096
 _recent_worker_exits: "dict[int, tuple[int, float]]" = {}
 
+# Retained ``Popen`` handles for workers we spawned, keyed by pid.
+#
+# WHY THIS EXISTS. ``_default_spawn`` used to abandon the ``Popen`` object and
+# return only the pid, relying on ``reap_worker_zombies`` to pick the exit
+# status up via ``waitpid(-1)``. That loses the race, and on macOS it loses it
+# deterministically: ``subprocess`` keeps abandoned handles in its private
+# ``_active`` list and reaps them from ``_cleanup()``, which runs at the top of
+# EVERY ``Popen`` construction anywhere in the process — including the
+# ``subprocess.run(["ps", ...])`` zombie probe inside ``_pid_alive`` itself.
+# So the liveness check two lines above ``_classify_worker_exit`` was eating
+# the very status that call needed.
+#
+# Measured on this board, 7 days to 2026-08-27: of 268 ``crashed`` runs, 177
+# (66%) carried the ``pid <n> not alive`` text — the ``unknown`` fallback —
+# against only 63 correctly classified as clean-exit protocol violations. Each
+# of those 177 got the wrong error text handed to its retry worker and counted
+# toward ``failure_limit``, so a worker that merely forgot its paperwork was
+# retried as if it had crashed, then blocked.
+#
+# Holding the handle takes the status out of the race entirely: nothing else
+# can reap a child we have not abandoned. Entries are removed as soon as
+# ``poll()`` returns, so this dict is bounded by live workers, not by history.
+_live_worker_procs: "dict[int, Any]" = {}
+
+
+def _register_worker_proc(proc: "Any") -> None:
+    """Retain a spawned worker's Popen handle so its exit status survives.
+
+    Called by the spawn path. The handle is released by
+    ``reap_worker_zombies`` once the child has actually exited.
+    """
+    try:
+        pid = int(getattr(proc, "pid", 0) or 0)
+    except (TypeError, ValueError):
+        return
+    if pid > 0:
+        _live_worker_procs[pid] = proc
+
+
+def _raw_status_from_returncode(returncode: int) -> int:
+    """Re-encode a ``Popen.returncode`` into a POSIX raw wait status.
+
+    ``_record_worker_exit`` / ``_classify_worker_exit`` speak raw wait status
+    (``os.WIFEXITED`` etc). ``poll()`` hands back the decoded form: ``>= 0`` is
+    an exit code, ``< 0`` is ``-signal``. Re-encoding here keeps both reap
+    paths feeding one classifier rather than growing a second format.
+    """
+    if returncode is None:
+        return 0
+    rc = int(returncode)
+    if rc < 0:
+        return -rc                      # WIFSIGNALED, WTERMSIG == -rc
+    return (rc & 0xFF) << 8             # WIFEXITED, WEXITSTATUS == rc
+
+
+def _reap_retained_worker_procs() -> "list[int]":
+    """Poll retained handles and record the exit status of any that finished.
+
+    This is the reliable path. ``waitpid(-1)`` below remains as a backstop for
+    children spawned before this registry existed (and for any spawn_fn that
+    still abandons its handle), but it is no longer load-bearing.
+    """
+    reaped: "list[int]" = []
+    for pid, proc in list(_live_worker_procs.items()):
+        try:
+            rc = proc.poll()
+        except Exception:               # noqa: BLE001 - never break dispatch
+            _live_worker_procs.pop(pid, None)
+            continue
+        if rc is None:
+            continue                    # still running
+        _record_worker_exit(pid, _raw_status_from_returncode(rc))
+        _live_worker_procs.pop(pid, None)
+        reaped.append(pid)
+    return reaped
+
 
 def _record_worker_exit(pid: int, raw_status: int) -> None:
     """Record a reaped child's exit status for later classification.
@@ -8298,7 +8374,9 @@ def reap_worker_zombies() -> "list[int]":
     Returns the list of reaped PIDs. Safe to call when there are no
     children (returns []). No-op on Windows.
     """
-    reaped: "list[int]" = []
+    # Retained handles first — see _live_worker_procs for why waitpid(-1)
+    # alone was losing 66% of exit statuses.
+    reaped: "list[int]" = _reap_retained_worker_procs()
     if os.name != "nt":
         try:
             while True:
@@ -11047,6 +11125,12 @@ def _default_spawn(
     # handle is kept alive by the child's inheritance.  The parent's
     # reference goes out of scope and is GC'd, but the OS-level FD stays
     # open in the child until the child exits.
+    #
+    # The Popen object itself, however, is RETAINED (see _live_worker_procs).
+    # Abandoning it hands the exit status to subprocess._cleanup(), which then
+    # loses it, and the worker gets misdiagnosed as "crashed" instead of
+    # "exited cleanly without calling kanban_complete".
+    _register_worker_proc(proc)
     return proc.pid
 
 
