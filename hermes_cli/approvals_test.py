@@ -8,6 +8,7 @@ guard (``check_all_command_guards``) applies them:
     1. container-skip gate (isolated backends bypass all guards),
     2. hardline blocklist (never bypassable, fires before yolo/off),
     3. sudo-stdin guard (unconditional),
+    3b. shared irreversible-command deny-list (unconditional),
     4. user ``approvals.deny`` rules (fire before yolo/off),
     5. yolo / ``approvals.mode: off`` bypass,
     6. permanent ``command_allowlist``,
@@ -42,6 +43,7 @@ _VERDICT_EXIT = {
     "allow": EXIT_ALLOW,
     "ask-approval": EXIT_ASK,
     "hardline-deny": EXIT_DENY,
+    "denylist-deny": EXIT_DENY,
     "user-deny": EXIT_DENY,
 }
 
@@ -101,6 +103,18 @@ def evaluate_command(command: str, env_type: str = "local") -> dict:
         return result(
             "hardline-deny", rule=sudo_desc,
             detail="sudo stdin guard (unconditional block)",
+        )
+
+    # 3b. Shared deny-list: the irreversible-command floor (merges, pushes to
+    #     protected branches, production ships). Unconditional, like the two
+    #     guards above — fires before the yolo / mode=off bypass.
+    is_denied, denylist_rule = approval.check_denylist_command(command)
+    if is_denied:
+        return result(
+            "denylist-deny", rule=denylist_rule,
+            detail="matches the shared irreversible-command deny-list in "
+                   "~/.hermes/hooks/denylist.py (blocked even under --yolo / "
+                   "mode=off); an agent may OPEN a PR, never merge one",
         )
 
     # 4. User-defined approvals.deny rules — fire before yolo/off.

@@ -4566,6 +4566,172 @@ def _await_gateway_decision(session_key: str, notify_cb, approval_data: dict,
     return {"resolved": resolved, "choice": choice, "reason": entry.reason}
 
 
+# ── Shared deny-list guard (irreversible command floor) ────────────────────
+# Hermes's HARDLINE/DANGEROUS pattern tables cover catastrophic *local*
+# commands (rm -rf /, mkfs, fork bombs). They contain no rule for the
+# irreversible *remote* actions that matter to a delegated agent: merging a
+# PR, pushing to a protected branch, or shipping to production.
+#
+# Measured 2026-08-27 via `hermes approvals test`, BEFORE this guard existed:
+#
+#     vercel deploy --prod        -> allow
+#     gh pr merge 1596 --squash   -> allow
+#     git push origin master      -> allow
+#     convex deploy --yes         -> allow
+#
+# Only `rm -rf` asked. This chain was not the ONLY defence — calcifer-bridge.py
+# is a registered pre_tool_call hook and already consulted the same classifier
+# (shell_hooks.py:813 honours its {decision: block}). But that hook fails OPEN
+# on exception (tool_executor.py:638) and is skipped at some call sites
+# (skip_pre_tool_call_hook=True), so it cannot be the only one either. Two
+# layers, covering each other's gaps.
+#
+# The rules live in ~/.hermes/hooks/denylist.py, which is a pure, unit-tested
+# classifier (test_denylist.py, 79 tests incl. an explicit falsifier). It is
+# shared rather than duplicated so the Claude Code bridge and Hermes cannot
+# drift apart — one table, two consumers. Add rules THERE, not here.
+_DENYLIST_MODULE = None
+_DENYLIST_LOAD_FAILED = False
+_DENYLIST_PATH = os.path.expanduser("~/.hermes/hooks/denylist.py")
+
+# Shell control operators that separate independent commands. `a && b` must
+# classify b too, or `true && gh pr merge` walks straight through.
+_SHELL_SEPARATORS = ("&&", "||", ";", "|", "&")
+
+# WHICH deny rules escalate to a hard block HERE.
+#
+# denylist.py is shared with the Claude Code bridge, where a `deny` verdict
+# means "prompt Sab". Hermes has no Sab to prompt mid-run, so a deny here is
+# terminal — which makes importing the WHOLE table the wrong move. Its
+# `rm_rf_outside_cwd` rule fires on `rm -rf ./node_modules` and `rm -rf dist`,
+# both of which a worker runs legitimately, and Hermes already routes those
+# through its own hardline (`rm -rf /`) and dangerous-command ask tiers.
+# Hard-blocking them here would break real work, and a gate that breaks real
+# work is a gate somebody switches off — which costs more than it saves.
+#
+# So this floor covers exactly the gap Hermes had NO rule for: actions that
+# reach OUTSIDE this machine and cannot be undone. Local destructiveness stays
+# with the tiers that already handle it.
+#
+# Matched as prefixes because several rule names are built per-target
+# (`gh_pr_merge`, `git_push_master`, `kamal_deploy`).
+_DENYLIST_ENFORCED_PREFIXES = (
+    "gh_pr_",          # merging or closing a PR       - operator-only
+    "git_push_",       # force / delete / protected-ref pushes
+    "git_filter_",     # history rewrite
+    "vercel_deploy_",  # production ship
+    "wrangler_",       # Cloudflare Pages/Workers ship
+    "convex_deploy_",  # backend schema + function ship
+    "kamal_",          # container deploy
+    "terraform_",      # infrastructure apply
+    "aws_s3_rm",       # remote delete
+    "kubectl_delete",  # remote delete
+)
+
+# Deliberately NOT enforced here, with the tier that owns each:
+#   rm_rf_outside_cwd -> hardline floor (`rm -rf /`) + dangerous-command ask
+#   pipe_to_sh        -> dangerous-command ask
+# Moving one of these into the tuple above is a real decision: it converts an
+# ask into an unappealable block for every worker. Do it deliberately, and add
+# the case to tests/tools/test_denylist_guard.py.
+
+
+def _load_denylist():
+    """Import the shared classifier once. Returns the module or None."""
+    global _DENYLIST_MODULE, _DENYLIST_LOAD_FAILED
+    if _DENYLIST_MODULE is not None or _DENYLIST_LOAD_FAILED:
+        return _DENYLIST_MODULE
+    try:
+        import importlib.util
+        spec = importlib.util.spec_from_file_location(
+            "hermes_shared_denylist", _DENYLIST_PATH
+        )
+        if spec is None or spec.loader is None:
+            raise ImportError(f"no loader for {_DENYLIST_PATH}")
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        _DENYLIST_MODULE = mod
+    except Exception as exc:  # noqa: BLE001 - must never brick the agent
+        # Fail OPEN but LOUD. Failing closed would make a missing file
+        # unrunnable for every command; the file is git-tracked so silent
+        # disappearance is not the expected case. An operator seeing this
+        # line should treat the no-ship floor as absent until it is fixed.
+        _DENYLIST_LOAD_FAILED = True
+        logger.error(
+            "DENY-LIST UNAVAILABLE (%s: %s) - the irreversible-command floor "
+            "is NOT being enforced. Fix %s.", type(exc).__name__, exc,
+            _DENYLIST_PATH,
+        )
+    return _DENYLIST_MODULE
+
+
+def _split_shell_segments(command: str) -> list:
+    """Split a command line into independently-classifiable segments."""
+    try:
+        lexer = shlex.shlex(command, posix=True, punctuation_chars=True)
+        lexer.whitespace_split = True
+        tokens = list(lexer)
+    except ValueError:
+        # Unbalanced quotes - fall back to the whole string as one segment.
+        try:
+            return [shlex.split(command)]
+        except ValueError:
+            return []
+    segments, current = [], []
+    for tok in tokens:
+        if tok in _SHELL_SEPARATORS:
+            if current:
+                segments.append(current)
+                current = []
+        else:
+            current.append(tok)
+    if current:
+        segments.append(current)
+    return segments
+
+
+def check_denylist_command(command: str) -> tuple:
+    """Classify a command against the shared deny-list.
+
+    Returns (is_denied, rule_name). Never raises.
+    """
+    mod = _load_denylist()
+    if mod is None:
+        return (False, None)
+    try:
+        for argv in _split_shell_segments(command):
+            if not argv:
+                continue
+            verdict, rule = mod.classify(argv, env=dict(os.environ))
+            if verdict != "deny":
+                continue
+            if not str(rule or "").startswith(_DENYLIST_ENFORCED_PREFIXES):
+                # A real deny, but one of the local-destructiveness rules that
+                # Hermes's own tiers already handle. Fall through to them
+                # rather than converting their ask into a hard block.
+                logger.debug("Deny-list rule %s not enforced at this tier", rule)
+                continue
+            return (True, rule)
+    except Exception as exc:  # noqa: BLE001
+        logger.error("Deny-list classification failed for %r: %s",
+                     command[:200], exc)
+    return (False, None)
+
+
+def _denylist_block_result(rule: str, command: str) -> dict:
+    return {
+        "approved": False,
+        "message": (
+            f"BLOCKED by the irreversible-command floor (rule: {rule}).\n\n"
+            f"  {command[:300]}\n\n"
+            "Merging a PR, pushing to a protected branch, and shipping to "
+            "production are operator-only actions. An agent may OPEN a PR; it "
+            "may never merge one. If this is a false positive, fix the rule in "
+            "~/.hermes/hooks/denylist.py and add a test - do not bypass it."
+        ),
+    }
+
+
 def check_all_command_guards(command: str, env_type: str,
                              approval_callback=None,
                              has_host_access: bool = False) -> dict:
@@ -4604,6 +4770,16 @@ def check_all_command_guards(command: str, env_type: str,
         logger.warning("Sudo stdin guard block: %s (command: %s)",
                        sudo_guess_desc, command[:200])
         return _sudo_stdin_block_result(sudo_guess_desc)
+
+    # == Irreversible-command floor (shared deny-list) ==
+    # Fires BEFORE the yolo / mode=off / cron approve-mode bypass, like the
+    # hardline floor: no session-level setting may ship to production or
+    # merge a PR. See _load_denylist above for why this is shared.
+    is_denied, denylist_rule = check_denylist_command(command)
+    if is_denied:
+        logger.warning("Deny-list block: %s (command: %s)",
+                       denylist_rule, command[:200])
+        return _denylist_block_result(denylist_rule, command)
 
     # User-defined deny rules (approvals.deny in config.yaml): like the
     # hardline floor, these fire BEFORE the yolo / mode=off bypass — a deny
