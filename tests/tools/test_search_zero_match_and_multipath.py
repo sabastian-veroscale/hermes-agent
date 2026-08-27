@@ -107,6 +107,32 @@ class TestMultiPathRecovery:
         assert "error" in r
         assert "Path not found" in r["error"]
 
+    def test_single_missing_path_sets_structured_path_not_found_flag(self, proj):
+        # Distinguishes "search root was absent" from "root existed, zero
+        # matches" without having to string-match the error text. Both
+        # produce total_count==0 + an error string; only the missing-path
+        # branch must carry the flag.
+        r = json.loads(search_tool("TOKEN_ALPHA", path=str(proj / "nonexistent_dir"), task_id="t-pnf"))
+        assert r["total_count"] == 0
+        assert r.get("error", "").startswith("Path not found:")
+        assert r.get("path_not_found") is True
+
+    def test_path_not_found_flag_absent_for_zero_match(self, proj):
+        # Root exists, search runs cleanly, zero matches — must NOT carry
+        # the path_not_found flag, even though total_count==0 and no error.
+        r = json.loads(search_tool("zzz_totally_absent_zzz", path=str(proj / "proj"), task_id="t-pnf-zero"))
+        assert r["total_count"] == 0
+        assert "error" not in r
+        assert "path_not_found" not in r
+
+    def test_files_target_missing_path_also_sets_flag(self, proj):
+        # Files-target (target='files') must surface the same flag — the
+        # not-found branch is shared with content search.
+        r = json.loads(search_tool("*.py", path=str(proj / "nonexistent_dir"), target="files", task_id="t-pnf-files"))
+        assert r["total_count"] == 0
+        assert r.get("error", "").startswith("Path not found:")
+        assert r.get("path_not_found") is True
+
     def test_files_target_multi_path(self, proj):
         p = f"{proj / 'proj'} {proj / 'extra'}"
         r = json.loads(search_tool("*.py", path=p, target="files", task_id="t-mp"))

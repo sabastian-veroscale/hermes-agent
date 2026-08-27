@@ -264,6 +264,11 @@ class SearchResult:
     limit_reason: Optional[str] = None
     warning: Optional[str] = None
     error: Optional[str] = None
+    # Distinguishes "path was missing" from "path existed, zero matches".
+    # Both produce total_count==0 + non-empty error; callers (model agents,
+    # the dispatcher's negative-result cache) historically had to string-match
+    # the error to tell them apart. Set only when the search root is absent.
+    path_not_found: Optional[bool] = None
     
     # Densify content-mode matches into a path-grouped text block above this
     # many matches. Below it, the verbose array is already compact enough that
@@ -327,6 +332,8 @@ class SearchResult:
             result["warning"] = self.warning
         if self.error:
             result["error"] = self.error
+        if self.path_not_found:
+            result["path_not_found"] = True
         return result
 
 
@@ -2823,7 +2830,8 @@ class ShellFileOperations(FileOperations):
                         )
             return SearchResult(
                 error=". ".join(hint_parts),
-                total_count=0
+                total_count=0,
+                path_not_found=True,
             )
         
         if target == "files":
