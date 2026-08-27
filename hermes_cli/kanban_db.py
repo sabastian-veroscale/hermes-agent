@@ -5111,6 +5111,88 @@ def release_stale_claims(
     return reclaimed
 
 
+def release_orphaned_claims(conn: sqlite3.Connection) -> int:
+    """Clear expired claim locks on tasks that are NOT running.
+
+    THE DEADLOCK THIS BREAKS. Two queries have to agree about a claim and
+    they disagree by exactly one row:
+
+      * ``release_stale_claims`` reclaims ``WHERE status = 'running'``.
+      * the dispatcher selects ready work ``WHERE claim_lock IS NULL``.
+
+    A task that lands back in ``ready`` while still holding a claim lock
+    satisfies neither. The reclaimer skips it because it is not running; the
+    dispatcher skips it because it is claimed. Nothing else ever looks at it,
+    so the card is stuck forever with no diagnostic — it simply sits in
+    ``ready`` while the board reports itself idle.
+
+    Found live on 2026-08-27: ``t_b6819a66`` and ``t_73042427`` had held
+    expired locks from ``Fortuna.local:29043`` since 2026-08-26 00:36. They
+    were the entire spawnable backlog — the other two ready cards name
+    non-Hermes profiles — so the board had been dispatching nothing for 38
+    hours and looked, from every status query, like it had simply run out of
+    work.
+
+    Only expired claims are touched, and never ``running`` ones: an unexpired
+    claim may be a handoff in flight, and a running claim belongs to
+    ``release_stale_claims``, which has liveness logic this does not
+    duplicate. Status is left exactly as it is — the lock is the bug, not the
+    phase.
+
+    Runs on dry-run ticks too, matching ``release_stale_claims`` immediately
+    above the call site. Both are recovery bookkeeping rather than work: a
+    dry run that skipped them would report the board as having nothing
+    spawnable, which is the opposite of what a real tick would do and would
+    hide the very stall this function exists to surface.
+
+    Returns the number of claims cleared. Safe to call every tick.
+    """
+    now = int(time.time())
+    with write_txn(conn):
+        rows = conn.execute(
+            "SELECT id, claim_lock, worker_pid, claim_expires, status "
+            "FROM tasks "
+            "WHERE claim_lock IS NOT NULL AND status != 'running' "
+            "  AND claim_expires IS NOT NULL AND claim_expires < ?",
+            (now,),
+        ).fetchall()
+        cleared = 0
+        for row in rows:
+            cur = conn.execute(
+                "UPDATE tasks SET claim_lock = NULL, claim_expires = NULL, "
+                "worker_pid = NULL "
+                "WHERE id = ? AND claim_lock IS ? AND status != 'running' "
+                "  AND claim_expires IS NOT NULL AND claim_expires < ?",
+                (row["id"], row["claim_lock"], now),
+            )
+            if cur.rowcount != 1:
+                continue
+            # Leave a trace. The whole failure mode was that this state
+            # produced no diagnostic anywhere, so an operator reading
+            # `hermes kanban tail` saw a silent board and no reason for it.
+            _append_event(
+                conn, row["id"], "orphaned_claim_released",
+                {
+                    "stale_lock": row["claim_lock"],
+                    "worker_pid": (
+                        int(row["worker_pid"])
+                        if row["worker_pid"] is not None else None
+                    ),
+                    "claim_expires": int(row["claim_expires"]),
+                    "status": row["status"],
+                    "now": now,
+                },
+            )
+            cleared += 1
+    if cleared:
+        _log.warning(
+            "kanban dispatch: cleared %d orphaned claim lock(s) on "
+            "non-running tasks (see 'orphaned_claim_released' events)",
+            cleared,
+        )
+    return cleared
+
+
 def reclaim_task(
     conn: sqlite3.Connection,
     task_id: str,
@@ -8154,6 +8236,12 @@ class DispatchResult:
     dead/gone worker). See the reconciliation pass for details."""
     spawned: list[tuple[str, str, str]] = field(default_factory=list)
     """List of ``(task_id, assignee, workspace_path)`` triples."""
+    orphaned_claims_released: int = 0
+    """Expired claim locks cleared from tasks that were not running.
+
+    Non-zero means a card had been deadlocked between the reclaimer (which
+    only looks at ``running``) and the dispatcher (which only takes
+    ``claim_lock IS NULL``). See ``release_orphaned_claims``."""
     skipped_unassigned: list[str] = field(default_factory=list)
     """Ready task ids skipped because they have no assignee at all.
     Operator-actionable — usually a misfiled task waiting for routing."""
@@ -10150,6 +10238,10 @@ def _dispatch_once_locked(
 
     result = DispatchResult()
     result.reclaimed = release_stale_claims(conn)
+    # Must run BEFORE ready_rows is selected: a card holding an orphaned lock
+    # is invisible to that query, so clearing it a tick later would just defer
+    # the same stall.
+    result.orphaned_claims_released = release_orphaned_claims(conn)
     if reconcile_orphans:
         # Orphaned-card reconciliation: requeue 'running' cards whose claim
         # bookkeeping is broken (no valid claim, dead/gone worker) that the
