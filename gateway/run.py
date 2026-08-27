@@ -2499,6 +2499,14 @@ from gateway.restart import (
     parse_restart_drain_timeout,
 )
 
+from gateway.source_watcher import (
+    DEFAULT_POLL_SECONDS as SOURCE_WATCH_POLL_SECONDS,
+    DEFAULT_QUIET_SECONDS as SOURCE_WATCH_QUIET_SECONDS,
+    SourceWatcher,
+    should_watch as should_watch_source,
+    source_root as gateway_source_root,
+)
+
 
 from gateway.whatsapp_identity import (
     canonical_whatsapp_identifier as _canonical_whatsapp_identifier,  # noqa: F401
@@ -6448,6 +6456,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
     # defaults so partial construction in tests doesn't blow up on access; the
     # real values are set in __init__ / start() / stop().
     _loop_heartbeat_task: Optional["asyncio.Task"] = None
+    _source_watcher_task: Optional["asyncio.Task"] = None
     _loop_floor_timer_handle: Optional[Any] = None
     _loop_liveness_watchdog: Optional[Any] = None
     _gateway_started_at: float = 0.0
@@ -11641,6 +11650,78 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             logger.warning("Legacy session recovery on startup failed: %s", exc)
         return exact, fallback
 
+    def _start_source_watcher_task(self) -> None:
+        """Restart the gateway when its own source changes on disk, idempotent.
+
+        The gateway imports its modules once. Editing ``kanban_db.py`` changes
+        nothing in the running process, so a fix stays inert until somebody
+        remembers to restart -- and the source disagreeing with the running
+        behaviour is invisible in exactly the wrong way.
+
+        Arms ONLY under an external supervisor (see ``should_watch``): a
+        restart request is an exit, and without something to start the next
+        process it is not a reload, it is the gateway disappearing because
+        someone saved a file.
+
+        Best-effort, like the loop heartbeat -- a convenience must never be
+        able to abort startup.
+        """
+        try:
+            existing = getattr(self, "_source_watcher_task", None)
+            if existing is not None and not existing.done():
+                return
+            if not should_watch_source():
+                return
+
+            root = gateway_source_root()
+            loop = asyncio.get_running_loop()
+
+            def _request() -> None:
+                # Hop back onto the loop: the tick runs in a worker thread.
+                loop.call_soon_threadsafe(
+                    lambda: self.request_restart(detached=False, via_service=True)
+                )
+
+            watcher = SourceWatcher(
+                root=root,
+                on_change=lambda _digest: _request(),
+                quiet_seconds=SOURCE_WATCH_QUIET_SECONDS,
+            )
+
+            async def _poll_source() -> None:
+                # Hashing ~540 files costs ~30ms of blocking IO, which is a
+                # visible stall on a chat gateway's loop -- so sample in a
+                # thread and keep the loop free.
+                while True:
+                    await asyncio.sleep(SOURCE_WATCH_POLL_SECONDS)
+                    if self._draining or self._restart_task_started:
+                        return
+                    try:
+                        fired = await asyncio.to_thread(watcher.tick, loop.time())
+                    except Exception:
+                        logger.debug("Source-watcher tick failed", exc_info=True)
+                        continue
+                    if fired:
+                        return
+
+            self._source_watcher_task = asyncio.create_task(_poll_source())
+            # PERMANENT for the process lifetime, same as the loop heartbeat --
+            # tag it so _scale_to_zero_has_live_background_work() doesn't treat
+            # an armed, otherwise-idle gateway as busy forever.
+            self._source_watcher_task._hermes_supervised_watcher = True  # type: ignore[attr-defined]
+            _bg = getattr(self, "_background_tasks", None)
+            if _bg is not None:
+                _bg.add(self._source_watcher_task)
+                self._source_watcher_task.add_done_callback(_bg.discard)
+            logger.info(
+                "Gateway source watcher armed on %s; a change that settles for "
+                "%.0fs requests a graceful restart",
+                root,
+                SOURCE_WATCH_QUIET_SECONDS,
+            )
+        except Exception:
+            logger.debug("Failed to start gateway source watcher", exc_info=True)
+
     async def start(self) -> bool:
         """
         Start the gateway and all configured platform adapters.
@@ -12351,6 +12432,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         self._running = True
         self._install_plugin_message_injector()
         self._update_runtime_status("running")
+
+        self._start_source_watcher_task()
 
         # Loop-liveness heartbeat (#66892): an asyncio task so a frozen loop
         # stops refreshing ``state/gateway.heartbeat``. Cancelled with the
