@@ -11214,6 +11214,67 @@ def run_daemon(
 # Worker context builder (what a spawned worker sees)
 # ---------------------------------------------------------------------------
 
+# Name of the durable per-task scratchpad. Lives in the task workspace, which
+# is keyed by task id and REUSED across retries — that reuse is the whole
+# mechanism: it is the only thing on the box that outlives a worker process.
+WORKER_NOTES_FILENAME = "WORK-ORDER.md"
+
+
+def _write_first_block(workspace: "Optional[str]") -> "list[str]":
+    """The write-first protocol, injected into every worker's context.
+
+    WHY. A worker gets a bounded iteration budget. When it runs out, the
+    process is killed and everything the worker learned dies with it — the
+    retry starts from the task body again and re-derives the same findings
+    with the same budget, which is why a card that exhausts once tends to
+    exhaust every time. Measured on the ops board, 7 days to 2026-08-27: 148
+    runs ended in ``iteration budget exhausted`` (93 timed_out + 55 gave_up),
+    the largest failure class after crash-misclassification.
+
+    The fix is not a bigger budget — it is making progress durable, so attempt
+    N+1 resumes instead of restarting. The task workspace is keyed by task id
+    and survives the process, so a file there is the natural carrier.
+
+    This lives in the context builder rather than in card bodies deliberately.
+    There are 214 open cards; editing their bodies fixes those 214 and none of
+    the next 214, and leaves two sources of the protocol to drift apart. One
+    function, every card, past and future.
+    """
+    if not workspace:
+        # No durable workspace to write into (unresolved / ephemeral) — the
+        # protocol would be a lie, so say nothing rather than instruct the
+        # worker to write somewhere that vanishes.
+        return []
+    path = f"{workspace.rstrip('/')}/{WORKER_NOTES_FILENAME}"
+    return [
+        "## Write-first protocol (applies to every task)",
+        "",
+        f"Your durable scratchpad for this task is `{path}`.",
+        "It lives in the task workspace, so it survives your process. Nothing",
+        "else you learn does.",
+        "",
+        f"1. **Read `{path}` before anything else.** If it exists, a previous",
+        "   attempt on this task wrote it. Start from what it already",
+        "   established; do not re-derive it.",
+        "2. **Write the file before you start working**, not after. Two",
+        "   headings are enough to begin: what done looks like, and the first",
+        "   step. A plan you did not write down is a plan that dies with you.",
+        "3. **Append each finding as you get it** — the file path you located,",
+        "   the command that worked, the number you measured, the approach you",
+        "   ruled out. Ruled-out approaches are worth as much as findings; they",
+        "   stop the next attempt repeating your dead end.",
+        "4. **If you run out of budget, the file is your handoff.** You will",
+        "   not get a chance to write it at the end, so there is no end to",
+        "   save it for.",
+        "",
+        "Then finish with `kanban_complete` or `kanban_block`. A run that ends",
+        "without one of those counts as failed no matter what it accomplished —",
+        "but if you wrote the file as you went, the retry inherits the work",
+        "instead of starting over.",
+        "",
+    ]
+
+
 def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
     """Return the full text a worker should read to understand its task.
 
@@ -11275,6 +11336,10 @@ def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
     if task.branch_name:
         lines.append(f"Branch:   {task.branch_name}")
     lines.append("")
+
+    # Before the body: the worker needs to know where to write before it
+    # reads what to do, or it reads the task and starts working.
+    lines.extend(_write_first_block(task.workspace_path))
 
     if task.body and task.body.strip():
         lines.append("## Body")
